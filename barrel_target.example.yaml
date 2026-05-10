@@ -1,0 +1,13 @@
+barrels:
+  - id: "Barrel_Alpha"
+    map_x: 2.0
+    map_y: 0.0
+    width: 0.6
+  - id: "Barrel_Bravo"
+    map_x: 3.5
+    map_y: 2.0
+    width: 0.6
+  - id: "Barrel_Charlie"
+    map_x: 1.0
+    map_y: 2.5
+    width: 0.6
