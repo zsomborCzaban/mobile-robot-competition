@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'barrel_challenge'
+package_name = 'barrel_lidar_detector'
 
 setup(
     name=package_name,
@@ -15,14 +15,15 @@ setup(
     zip_safe=True,
     maintainer='ubuntu',
     maintainer_email='ubuntu@todo.todo',
-    description='TurtleBot 4 Barrel Discovery and Navigation Framework',
+    description='LiDAR and map-shape based barrel candidate detector for TurtleBot 4.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            # Format: 'command_name = package_name.script_name:main_function'
-            'mission_controller = barrel_challenge.barrel_mission:main',
-            'ui_remote = barrel_challenge.ui_button:main'
+            'lidar_cluster_detector = barrel_lidar_detector.lidar_cluster_detector:main',
+            'map_shape_detector = barrel_lidar_detector.map_shape_detector:main',
+            'mission_controller = barrel_lidar_detector.mission_controller:main',
+            'ui_remote = barrel_lidar_detector.ui_button:main',
         ],
     },
 )
