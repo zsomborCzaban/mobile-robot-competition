@@ -65,10 +65,92 @@ source install/setup.bash
 If you are inside this repository directly, `colcon build` also works because
 the package is at the repository root.
 
+## What Runs Where
+
+Recommended setup:
+
+- Raspberry Pi 4B on the TurtleBot runs the robot-side ROS nodes: robot
+  bringup, RPLiDAR, localization or SLAM, Nav2, barrel detection, and mission
+  control.
+- Laptop/desktop computer runs RViz. This keeps visualization load off the
+  Raspberry Pi.
+
+When a command is listed under "Raspberry Pi", run it in a terminal on the
+Raspberry Pi. It is fine to type it through SSH from your computer, as long as
+the shell is connected to the Raspberry Pi.
+
+When a command is listed under "Computer", run it on your laptop/desktop.
+
+Both machines must use the same ROS network settings, especially:
+
+```bash
+export ROS_DOMAIN_ID=<same_number_on_both_machines>
+```
+
+Use the same value that your TurtleBot 4 setup already uses.
+
+### Raspberry Pi
+
+Start the normal TurtleBot 4 stack first. Exact commands depend on your robot
+setup, but the Raspberry Pi must provide:
+
+```text
+/scan
+/map
+map -> odom -> base_link/base_footprint -> rplidar_link
+Nav2
+```
+
+Then build and source this package on the Raspberry Pi:
+
+```bash
+cd ~/turtlebot4_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select barrel_lidar_detector --symlink-install
+source install/setup.bash
+```
+
+Run the barrel system on the Raspberry Pi:
+
+```bash
+ros2 run barrel_lidar_detector lidar_cluster_detector
+ros2 run barrel_lidar_detector map_shape_detector
+ros2 run barrel_lidar_detector mission_controller
+```
+
+Or use the button UI on the Raspberry Pi:
+
+```bash
+ros2 run barrel_lidar_detector ui_remote
+```
+
+The button UI starts detector/controller processes on the same machine where the
+UI is launched. For the recommended setup, launch it on the Raspberry Pi.
+
+### Computer
+
+Run RViz on your laptop/desktop:
+
+```bash
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=<same_number_as_raspberry_pi>
+rviz2
+```
+
+The computer does not need to run the detector nodes just to view markers,
+because all marker topics use standard ROS message types. It only needs this
+package built if you intentionally want to run `ui_remote` or the detector nodes
+from the computer.
+
+If you run `ui_remote` on the computer, it starts the detector/controller nodes
+on the computer, not on the Raspberry Pi. That can work over ROS networking, but
+the recommended project setup is to run the robot-side nodes on the Raspberry Pi
+and use the computer for RViz.
+
 ## Run Manually
 
-Start the normal TurtleBot 4 stack first: robot bringup, RPLiDAR, TF,
-localization or SLAM, `/map`, and Nav2.
+Run these commands on the Raspberry Pi after robot bringup, RPLiDAR, TF,
+localization or SLAM, `/map`, and Nav2 are active.
 
 Then run the detector nodes:
 
@@ -98,7 +180,8 @@ closest to the robot, and orients the robot toward the barrel.
 
 ## Run With Buttons
 
-Run the UI:
+Recommended: run the UI on the Raspberry Pi, because it starts the detector and
+mission-controller processes on the same machine:
 
 ```bash
 ros2 run barrel_lidar_detector ui_remote
