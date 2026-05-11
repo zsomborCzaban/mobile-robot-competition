@@ -6,9 +6,12 @@ from typing import Dict, Optional, Tuple, List
 import rclpy
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.time import Time
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 import tf2_geometry_msgs  # noqa: F401  Registers geometry_msgs transforms with tf2.
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -22,6 +25,11 @@ class BarrelMissionController(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('approach_offset', 0.60)
         self.declare_parameter('pose_timeout_sec', 5.0)
+        self.declare_parameter('barrel_pose_topic', '/barrel_pose')
+        self.declare_parameter('camera_barrel_confirm_topic', '/camera_barrel_confirmed')
+        self.declare_parameter('lidar_target_fresh_sec', 1.0)
+        self.declare_parameter('use_strict_camera', False)
+        self.declare_parameter('strict_camera_validation_topic', '/strict_camera_validation')
 
         self.target_frame = self.get_parameter('target_frame').value
         self.base_frame = self.get_parameter('base_frame').value
@@ -35,6 +43,36 @@ class BarrelMissionController(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.navigator = BasicNavigator()
 
+        self.camera_barrel_confirmed: bool = False
+        self.last_lidar_target_time: Optional[Time] = None
+        self.use_strict_camera: bool = bool(self.get_parameter('use_strict_camera').value)
+        # When True, the next LiDAR-active / camera-false cycle under strict mode may trigger a pause.
+        self._strict_pause_edge_armed: bool = True
+
+        barrel_pose_topic = str(self.get_parameter('barrel_pose_topic').value)
+        camera_topic = str(self.get_parameter('camera_barrel_confirm_topic').value)
+        strict_topic = str(self.get_parameter('strict_camera_validation_topic').value)
+        self.create_subscription(
+            Bool,
+            camera_topic,
+            self._camera_barrel_confirm_callback,
+            10,
+        )
+        self.create_subscription(
+            PoseStamped,
+            barrel_pose_topic,
+            self._barrel_pose_callback,
+            10,
+        )
+        self.create_subscription(
+            Bool,
+            strict_topic,
+            self._strict_camera_validation_callback,
+            10,
+        )
+
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
         # --- Services ---
         self.create_service(Trigger, 'calculate_target', self.calc_callback)
         self.create_service(Trigger, 'start_navigation', self.nav_callback)
@@ -46,6 +84,40 @@ class BarrelMissionController(Node):
         self.timer = self.create_timer(0.5, self.control_loop)
 
         self.get_logger().info('Advanced Multi-Barrel Mission Controller ready.')
+
+    def _camera_barrel_confirm_callback(self, msg: Bool) -> None:
+        self.camera_barrel_confirmed = bool(msg.data)
+
+    def _barrel_pose_callback(self, msg: PoseStamped) -> None:
+        self.last_lidar_target_time = self.get_clock().now()
+
+    def _strict_camera_validation_callback(self, msg: Bool) -> None:
+        """Safety switch from the UI (or any publisher) on strict_camera_validation_topic."""
+        self.use_strict_camera = bool(msg.data)
+        self.get_logger().info(
+            f'Strict camera validation {"enabled" if self.use_strict_camera else "disabled"} '
+            f'(via topic).',
+            throttle_duration_sec=1.0,
+        )
+
+    def _on_set_parameters(self, params: List[Parameter]) -> SetParametersResult:
+        for param in params:
+            if param.name == 'use_strict_camera' and param.type_ == Parameter.Type.BOOL:
+                self.use_strict_camera = bool(param.value)
+                self.get_logger().info(
+                    f'Strict camera validation {"enabled" if self.use_strict_camera else "disabled"} '
+                    f'(via parameter).',
+                )
+        return SetParametersResult(successful=True)
+
+    def _lidar_target_is_fresh(self) -> bool:
+        if self.last_lidar_target_time is None:
+            return False
+        age_sec = (
+            self.get_clock().now() - self.last_lidar_target_time
+        ).nanoseconds * 1e-9
+        fresh_sec = float(self.get_parameter('lidar_target_fresh_sec').value)
+        return age_sec <= fresh_sec
 
     def calc_callback(self, request, response):
         """Reads YAML, finds shortest path, calculates dynamic offsets."""
@@ -123,6 +195,7 @@ class BarrelMissionController(Node):
         self.get_logger().info('Starting multi-barrel navigation!')
         self.navigator.waitUntilNav2Active()
         self.state = "NAVIGATING"
+        self._strict_pause_edge_armed = True
         self.send_current_waypoint()
 
         response.success = True
@@ -141,6 +214,7 @@ class BarrelMissionController(Node):
     def resume_callback(self, request, response):
         if self.state == "PAUSED":
             self.state = "NAVIGATING"
+            self._strict_pause_edge_armed = True
             self.send_current_waypoint()
             response.success, response.message = True, "Resuming Navigation."
         else:
@@ -151,6 +225,7 @@ class BarrelMissionController(Node):
         self.navigator.cancelTask()
         self.state = "IDLE"
         self.waypoints = []
+        self._strict_pause_edge_armed = True
         response.success, response.message = True, "Mission Stopped and Reset."
         return response
 
@@ -164,6 +239,13 @@ class BarrelMissionController(Node):
         """Timer loop tracking robot progress"""
         if self.state != "NAVIGATING":
             return
+
+        self._apply_strict_camera_policy_if_needed()
+
+        if self.state != "NAVIGATING":
+            return
+
+        self._log_visual_confirmation_if_lidar_active()
 
         if self.navigator.isTaskComplete():
             result = self.navigator.getResult()
@@ -183,6 +265,52 @@ class BarrelMissionController(Node):
                     self.send_current_waypoint()
                 else:
                     self.state = "IDLE"
+
+    def _apply_strict_camera_policy_if_needed(self) -> None:
+        """If strict camera validation is on, pause navigation when LiDAR is active but the camera disagrees."""
+        violation = (
+            self.use_strict_camera
+            and self._lidar_target_is_fresh()
+            and not self.camera_barrel_confirmed
+        )
+        if not violation:
+            self._strict_pause_edge_armed = True
+            return
+
+        if not self._strict_pause_edge_armed:
+            return
+
+        self._strict_pause_edge_armed = False
+        self.get_logger().error(
+            'Strict camera validation: LiDAR reports an active barrel target but '
+            'camera_barrel_confirmed is False. Pausing navigation for safety.'
+        )
+        self.navigator.cancelTask()
+        self.state = "PAUSED"
+
+    def _log_visual_confirmation_if_lidar_active(self) -> None:
+        """While navigating, compare LiDAR barrel pose activity with the camera validator topic."""
+        if not self._lidar_target_is_fresh():
+            return
+        if self.camera_barrel_confirmed:
+            self.get_logger().info(
+                'Visual Confirmation Success: LiDAR target present and camera_barrel_confirmed is True.',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        if self.use_strict_camera:
+            self.get_logger().warn(
+                'Strict camera validation is enabled: LiDAR target is active without camera confirmation. '
+                'Navigation is paused when this condition is detected (see error log).',
+                throttle_duration_sec=2.0,
+            )
+        else:
+            self.get_logger().warn(
+                'Visual confirmation mismatch: LiDAR target is active but camera_barrel_confirmed is False '
+                '(logging only; strict camera validation is off).',
+                throttle_duration_sec=2.0,
+            )
 
     def robot_position(self) -> Optional[Tuple[float, float]]:
         try:

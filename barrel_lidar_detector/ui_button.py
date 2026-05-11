@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
 
@@ -17,8 +18,20 @@ class MissionUIButton(Node):
         self.cli_pause = self.create_client(Trigger, 'pause_navigation')
         self.cli_res = self.create_client(Trigger, 'resume_navigation')
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
-        
+
+        # Safety switch: mission_controller subscribes and toggles strict LiDAR vs camera policy.
+        self.pub_strict_camera_validation = self.create_publisher(
+            Bool,
+            '/strict_camera_validation',
+            10,
+        )
+
         self.processes: Dict[str, subprocess.Popen] = {}
+
+    def publish_strict_camera_validation(self, enabled: bool) -> None:
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.pub_strict_camera_validation.publish(msg)
 
     def start_mission_controller(self, status_label) -> None:
         if self.cli_calc.wait_for_service(timeout_sec=0.2):
@@ -113,10 +126,51 @@ def main(args=None) -> None:
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
     # Increased height to fit new buttons
-    root.geometry('360x550') 
+    root.geometry('360x620')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
+
+    strict_var = tk.BooleanVar(value=False)
+
+    def on_strict_toggle() -> None:
+        enabled = bool(strict_var.get())
+        node.publish_strict_camera_validation(enabled)
+        status_lbl.config(
+            text=(
+                'Strict camera validation is ON (mission pauses if camera disagrees with LiDAR).'
+                if enabled
+                else 'Strict camera validation is OFF (camera mismatch is log-only).'
+            ),
+            fg='#E65100',
+        )
+
+    strict_frame = tk.LabelFrame(
+        root,
+        text=' Safety Switch ',
+        font=('Arial', 10, 'bold'),
+        fg='#E65100',
+        bg='#FFF3E0',
+        padx=8,
+        pady=6,
+    )
+    strict_frame.pack(fill='x', padx=10, pady=(4, 8))
+
+    strict_check = tk.Checkbutton(
+        strict_frame,
+        text='AI Camera Validation', # 
+        variable=strict_var,
+        command=on_strict_toggle,
+        font=('Arial', 11, 'bold'),
+        fg='black',
+        bg='#FFF3E0',
+        activebackground='#FFE0B2',
+        activeforeground='black',
+        highlightthickness=0,
+        selectcolor='#FF9800',
+        indicatoron=True,
+    )
+    strict_check.pack(anchor='w')
 
     # --- Setup & Detection Frame ---
     btn_controller = tk.Button(root, text='1. Start Mission Controller', font=('Arial', 11, 'bold'), bg='lightgray', fg='black',
@@ -162,6 +216,11 @@ def main(args=None) -> None:
         root.destroy()
 
     root.protocol('WM_DELETE_WINDOW', on_close)
+
+    def sync_strict_after_spin() -> None:
+        node.publish_strict_camera_validation(strict_var.get())
+
+    root.after(400, sync_strict_after_spin)
     root.mainloop()
 
 
