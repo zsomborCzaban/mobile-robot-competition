@@ -7,6 +7,7 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 import tf2_geometry_msgs  # noqa: F401  Registers geometry_msgs transforms with tf2.
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -44,6 +45,8 @@ class LidarClusterDetector(Node):
         self.declare_parameter('max_cluster_width', 1.00)
         self.declare_parameter('front_only', False)
         self.declare_parameter('front_angle_deg', 90.0)
+        self.declare_parameter('transform_timeout_sec', 0.5)
+        self.declare_parameter('use_latest_transform', True)
 
         self.scan_topic = self.get_parameter('scan_topic').value
         self.target_frame = self.get_parameter('target_frame').value
@@ -95,6 +98,12 @@ class LidarClusterDetector(Node):
 
         if selected_map_pose is None:
             self.publish_delete_selected_marker(scan.header.frame_id)
+            self.get_logger().warn(
+                f'No /barrel_pose published: cannot transform selected '
+                f'LiDAR candidate from {scan.header.frame_id} to '
+                f'{self.target_frame}. Check the TF tree.',
+                throttle_duration_sec=2.0,
+            )
             return
 
         selected_map_pose.pose.position.z = 0.0
@@ -235,11 +244,22 @@ class LidarClusterDetector(Node):
         return pose
 
     def transform_pose(self, pose: PoseStamped, target_frame: str) -> Optional[PoseStamped]:
+        if pose.header.frame_id == target_frame:
+            return pose
+
+        pose_for_transform = pose
+        if bool(self.get_parameter('use_latest_transform').value):
+            pose_for_transform = PoseStamped()
+            pose_for_transform.header.frame_id = pose.header.frame_id
+            pose_for_transform.header.stamp = Time().to_msg()
+            pose_for_transform.pose = pose.pose
+
+        timeout_sec = float(self.get_parameter('transform_timeout_sec').value)
         try:
             return self.tf_buffer.transform(
-                pose,
+                pose_for_transform,
                 target_frame,
-                timeout=Duration(seconds=0.2),
+                timeout=Duration(seconds=timeout_sec),
             )
         except TransformException as exc:
             self.get_logger().warn(

@@ -11,8 +11,6 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from rclpy.duration import Duration
 from rclpy.node import Node
-import tf2_geometry_msgs  # noqa: F401  Registers geometry_msgs transforms with tf2.
-from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -76,9 +74,6 @@ class MapShapeDetector(Node):
         self.lidar_pose_topic = self.get_parameter('lidar_pose_topic').value
         self.target_frame = self.get_parameter('target_frame').value
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
         self.map_candidates: List[MapCandidate] = []
         self.latest_lidar_pose: Optional[PoseStamped] = None
         self.latest_lidar_time = None
@@ -136,11 +131,16 @@ class MapShapeDetector(Node):
         self.publish_confirmed_candidate()
 
     def lidar_pose_callback(self, pose: PoseStamped) -> None:
-        pose_in_target_frame = self.transform_pose(pose, self.target_frame)
-        if pose_in_target_frame is None:
+        if pose.header.frame_id != self.target_frame:
+            self.get_logger().warn(
+                f'Ignoring /barrel_pose in frame {pose.header.frame_id}; '
+                f'expected {self.target_frame}. The LiDAR detector must '
+                'publish transformed map-frame barrel poses.',
+                throttle_duration_sec=2.0,
+            )
             return
 
-        self.latest_lidar_pose = pose_in_target_frame
+        self.latest_lidar_pose = pose
         self.latest_lidar_time = self.get_clock().now()
         self.publish_confirmed_candidate()
 
@@ -326,28 +326,6 @@ class MapShapeDetector(Node):
             orientation.y * orientation.y + orientation.z * orientation.z
         )
         return math.atan2(siny_cosp, cosy_cosp)
-
-    def transform_pose(
-        self,
-        pose: PoseStamped,
-        target_frame: str,
-    ) -> Optional[PoseStamped]:
-        if pose.header.frame_id == target_frame:
-            return pose
-
-        try:
-            return self.tf_buffer.transform(
-                pose,
-                target_frame,
-                timeout=Duration(seconds=0.2),
-            )
-        except TransformException as exc:
-            self.get_logger().warn(
-                f'Could not transform pose from {pose.header.frame_id} '
-                f'to {target_frame}: {exc}',
-                throttle_duration_sec=2.0,
-            )
-            return None
 
     def publish_map_candidate_markers(self, stamp) -> None:
         marker_array = MarkerArray()
