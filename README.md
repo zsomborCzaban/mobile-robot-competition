@@ -4,7 +4,9 @@ ROS 2 Humble package: `barrel_lidar_detector`
 
 It detects barrel candidates without AprilTags:
 
-- `lidar_cluster_detector`: finds object-sized clusters from `/scan`.
+- `lidar_cluster_detector`: tracks curved LiDAR clusters over multiple scans and
+  publishes `/barrel_pose` only after the accumulated points fit a circle better
+  than a straight line.
 - `map_shape_detector`: finds round blobs in `/map` and confirms them with LiDAR.
 - `mission_controller`: reads the barrel YAML and sends all approach goals to Nav2.
 - `ui_remote`: button UI for starting detection and navigation.
@@ -229,7 +231,8 @@ Add barrel displays with `Add -> By topic`:
 
 Most useful displays:
 
-- `/barrel_candidate_markers`: all LiDAR object candidates.
+- `/barrel_candidate_markers`: single-scan curved LiDAR candidates.
+- `/barrel_marker`: stable multi-scan LiDAR barrel track.
 - `/barrel_map_candidate_markers`: round objects found in the map.
 - `/barrel_confirmed_marker`: candidate confirmed by LiDAR and map shape.
 - `/barrel_confirmed_pose`: stable pose written into the barrel YAML.
@@ -284,25 +287,36 @@ ros2 run barrel_lidar_detector mission_controller --ros-args \
 Default object size:
 
 ```text
-0.30 m to 1.20 m
+Map blobs: 0.20 m to 1.20 m
+LiDAR clusters: 0.20 m to 1.20 m
 ```
 
 Useful parameters:
 
 ```bash
 ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
-  -p min_cluster_width:=0.40 \
-  -p max_cluster_width:=1.00 \
+  -p min_cluster_width:=0.20 \
+  -p max_cluster_width:=1.20 \
+  -p require_curved_cluster:=true \
+  -p min_cluster_arc_depth:=0.035 \
+  -p min_cluster_range_depth:=0.055 \
+  -p min_cluster_circle_radius:=0.08 \
+  -p max_cluster_circle_radius:=0.80 \
+  -p track_min_observations:=5 \
+  -p track_min_view_bins:=2 \
+  -p track_max_circle_rmse:=0.08 \
+  -p track_min_line_circle_ratio:=1.25 \
   -p cluster_gap:=0.15 \
   -p max_range:=3.0
 ```
 
 ```bash
 ros2 run barrel_lidar_detector map_shape_detector --ros-args \
-  -p min_blob_diameter:=0.30 \
+  -p min_blob_diameter:=0.20 \
   -p max_blob_diameter:=1.20 \
   -p max_corner_fill_ratio:=0.35 \
   -p max_bounding_box_fill_ratio:=0.88 \
+  -p allow_spatial_fallback:=false \
   -p marker_max_diameter:=0.45 \
   -p confirm_distance:=0.65 \
   -p stable_confirmations:=4
@@ -314,8 +328,21 @@ For older YAML entries without surface fields, it falls back to `width / 2 +
 approach_offset` from the barrel center. If Nav2 still refuses to get that
 close, reduce the Nav2 costmap inflation radius in your Nav2 config.
 
+These size limits are intentionally broad because the challenge barrel size may
+change. The main rejection logic is now:
+
+- a curved single-scan LiDAR candidate,
+- a persistent LiDAR track with enough observations and view bins,
+- accumulated track points fitting a circle better than a straight line,
+- map roundness/corner-fill checks,
+- repeated map/LiDAR confirmation before YAML writes.
+
 If magenta confirmed markers appear on non-barrels, increase
 `stable_confirmations`, `min_confirmed_roundness`, or
 `min_confirmed_minor_major_ratio`. If rectangular boxes are marked as barrels,
-lower `max_corner_fill_ratio` or `max_bounding_box_fill_ratio`. If real barrels
-are missed, lower those values slightly or increase `confirm_distance`.
+lower `max_corner_fill_ratio` or `max_bounding_box_fill_ratio`. If flat objects
+still appear as green LiDAR candidates, increase `min_cluster_arc_depth` or
+`min_cluster_range_depth`. If flat objects reach the yellow/orange LiDAR track,
+increase `track_min_observations`, `track_min_view_bins`, or
+`track_min_line_circle_ratio`. If real barrels are missed, lower those values
+slightly or increase `confirm_distance`.

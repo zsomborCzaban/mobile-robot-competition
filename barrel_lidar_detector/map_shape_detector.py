@@ -57,7 +57,7 @@ class MapShapeDetector(Node):
         self.declare_parameter('target_frame', 'map')
         self.declare_parameter('occupied_threshold', 65)
         self.declare_parameter('min_blob_cells', 4)
-        self.declare_parameter('min_blob_diameter', 0.30)
+        self.declare_parameter('min_blob_diameter', 0.20)
         self.declare_parameter('max_blob_diameter', 1.20)
         self.declare_parameter('min_roundness', 0.45)
         self.declare_parameter('min_minor_major_ratio', 0.45)
@@ -66,6 +66,7 @@ class MapShapeDetector(Node):
         self.declare_parameter('max_bounding_box_fill_ratio', 0.88)
         self.declare_parameter('confirm_distance', 0.65)
         self.declare_parameter('fallback_confirm_distance', 0.85)
+        self.declare_parameter('allow_spatial_fallback', False)
         self.declare_parameter('lidar_pose_timeout_sec', 3.0)
         self.declare_parameter('lidar_weight', 0.70)
         self.declare_parameter('min_confirmed_roundness', 0.55)
@@ -77,7 +78,7 @@ class MapShapeDetector(Node):
         self.declare_parameter('stable_confirmations', 4)
         self.declare_parameter('expected_barrel_count', 0)
         self.declare_parameter('min_barrel_width', 0.30)
-        self.declare_parameter('max_barrel_width', 0.45)
+        self.declare_parameter('max_barrel_width', 1.20)
         self.declare_parameter('marker_max_diameter', 0.45)
         self.declare_parameter('confirmation_track_distance', 0.50)
         self.declare_parameter('confirmation_track_timeout_sec', 8.0)
@@ -586,6 +587,9 @@ class MapShapeDetector(Node):
         fallback_confirm_distance = float(
             self.get_parameter('fallback_confirm_distance').value
         )
+        allow_spatial_fallback = bool(
+            self.get_parameter('allow_spatial_fallback').value
+        )
         lidar_x = lidar_pose.pose.position.x
         lidar_y = lidar_pose.pose.position.y
 
@@ -626,7 +630,7 @@ class MapShapeDetector(Node):
                 throttle_duration_sec=3.0,
             )
 
-        if closest_any_distance <= fallback_confirm_distance:
+        if allow_spatial_fallback and closest_any_distance <= fallback_confirm_distance:
             self.get_logger().info(
                 'Using spatial fallback for magenta confirmation: closest map '
                 f'candidate is {closest_any_distance:.2f} m from LiDAR pose.',
@@ -642,10 +646,14 @@ class MapShapeDetector(Node):
                 throttle_duration_sec=3.0,
             )
         else:
+            fallback_text = (
+                f'fallback limit is {fallback_confirm_distance:.2f} m.'
+                if allow_spatial_fallback
+                else 'spatial fallback is disabled.'
+            )
             self.get_logger().info(
                 'No magenta marker: closest map candidate is '
-                f'{closest_any_distance:.2f} m from LiDAR pose, fallback limit '
-                f'is {fallback_confirm_distance:.2f} m.',
+                f'{closest_any_distance:.2f} m from LiDAR pose; {fallback_text}',
                 throttle_duration_sec=3.0,
             )
 

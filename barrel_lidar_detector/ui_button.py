@@ -174,8 +174,8 @@ def create_marker_legend(root) -> None:
     )
     legend.pack(fill='x', padx=10, pady=(4, 8))
 
-    add_legend_row(legend, '#00cc59', 'Green', 'LiDAR barrel-sized candidates')
-    add_legend_row(legend, '#ff8c00', 'Yellow/orange', 'selected LiDAR candidate')
+    add_legend_row(legend, '#00cc59', 'Green', 'single-scan curved LiDAR candidates')
+    add_legend_row(legend, '#ff8c00', 'Yellow/orange', 'stable multi-scan LiDAR barrel track')
     add_legend_row(legend, '#1a73ff', 'Light blue', 'map round-object candidates')
     add_legend_row(legend, '#0040ff', 'Blue', 'best map candidate')
     add_legend_row(legend, '#ff00ff', 'Magenta', 'stable confirmed barrel, written to YAML')
