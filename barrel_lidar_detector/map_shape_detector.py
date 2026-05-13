@@ -54,14 +54,14 @@ class MapShapeDetector(Node):
         self.declare_parameter('max_blob_diameter', 1.00)
         self.declare_parameter('min_roundness', 0.45)
         self.declare_parameter('min_minor_major_ratio', 0.45)
-        self.declare_parameter('confirm_distance', 0.50)
+        self.declare_parameter('confirm_distance', 0.65)
         self.declare_parameter('lidar_pose_timeout_sec', 3.0)
         self.declare_parameter('lidar_weight', 0.70)
-        self.declare_parameter('min_confirmed_roundness', 0.65)
-        self.declare_parameter('min_confirmed_minor_major_ratio', 0.70)
-        self.declare_parameter('min_confirmed_score', 0.62)
-        self.declare_parameter('stable_confirmations', 3)
-        self.declare_parameter('confirmation_track_distance', 0.35)
+        self.declare_parameter('min_confirmed_roundness', 0.55)
+        self.declare_parameter('min_confirmed_minor_major_ratio', 0.55)
+        self.declare_parameter('min_confirmed_score', 0.50)
+        self.declare_parameter('stable_confirmations', 2)
+        self.declare_parameter('confirmation_track_distance', 0.50)
         self.declare_parameter('confirmation_track_timeout_sec', 8.0)
         self.declare_parameter('write_barrel_yaml', True)
         self.declare_parameter(
@@ -438,7 +438,7 @@ class MapShapeDetector(Node):
         marker.color.g = 0.0
         marker.color.b = 1.0
         marker.color.a = 0.9
-        marker.lifetime = Duration(seconds=0.75).to_msg()
+        marker.lifetime = Duration(seconds=2.0).to_msg()
         self.confirmed_marker_pub.publish(marker)
 
     def valid_lidar_pose(self) -> Optional[PoseStamped]:

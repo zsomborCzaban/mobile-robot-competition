@@ -192,8 +192,8 @@ ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
 ros2 run barrel_lidar_detector map_shape_detector --ros-args \
   -p min_blob_diameter:=0.40 \
   -p max_blob_diameter:=1.00 \
-  -p confirm_distance:=0.50 \
-  -p stable_confirmations:=3
+  -p confirm_distance:=0.65 \
+  -p stable_confirmations:=2
 ```
 
 If magenta confirmed markers appear on non-barrels, increase

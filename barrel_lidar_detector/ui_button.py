@@ -103,6 +103,42 @@ def run_ros_spin(node: MissionUIButton) -> None:
     rclpy.spin(node)
 
 
+def add_legend_row(parent, color: str, title: str, detail: str) -> None:
+    row = tk.Frame(parent)
+    row.pack(fill='x', pady=1)
+
+    swatch = tk.Canvas(row, width=18, height=14, highlightthickness=0)
+    swatch.create_rectangle(2, 2, 16, 12, fill=color, outline='black')
+    swatch.pack(side='left', padx=(0, 6))
+
+    label = tk.Label(
+        row,
+        text=f'{title}: {detail}',
+        anchor='w',
+        justify='left',
+        font=('Arial', 9),
+        wraplength=285,
+    )
+    label.pack(side='left', fill='x', expand=True)
+
+
+def create_marker_legend(root) -> None:
+    legend = tk.LabelFrame(
+        root,
+        text='RViz marker legend',
+        font=('Arial', 10, 'bold'),
+        padx=8,
+        pady=5,
+    )
+    legend.pack(fill='x', padx=10, pady=(4, 8))
+
+    add_legend_row(legend, '#00cc59', 'Green', 'LiDAR barrel-sized candidates')
+    add_legend_row(legend, '#ff8c00', 'Yellow/orange', 'selected LiDAR candidate')
+    add_legend_row(legend, '#1a73ff', 'Light blue', 'map round-object candidates')
+    add_legend_row(legend, '#0040ff', 'Blue', 'best map candidate')
+    add_legend_row(legend, '#ff00ff', 'Magenta', 'stable confirmed barrel, written to YAML')
+
+
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = MissionUIButton()
@@ -112,8 +148,7 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    # Increased height to fit new buttons
-    root.geometry('360x550') 
+    root.geometry('390x680')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
@@ -154,6 +189,7 @@ def main(args=None) -> None:
               command=lambda: node.trigger_action(node.cli_stop, "Stopping Mission", status_lbl)).pack(fill='x', padx=10, pady=2)
 
     status_lbl.pack(pady=10)
+    create_marker_legend(root)
 
     def on_close() -> None:
         node.stop_child_processes()
