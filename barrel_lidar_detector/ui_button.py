@@ -20,18 +20,34 @@ class MissionUIButton(Node):
         
         self.processes: Dict[str, subprocess.Popen] = {}
 
-    def start_mission_controller(self, status_label) -> None:
+    def start_mission_controller(self, status_label, barrel_count_text: str) -> None:
         if self.cli_calc.wait_for_service(timeout_sec=0.2):
             status_label.config(text='Mission controller already running.', fg='green')
             return
 
+        expected_count = self.parse_expected_barrel_count(barrel_count_text, status_label)
+        if expected_count is None:
+            return
+
         self.start_process(
             'mission_controller',
-            ['ros2', 'run', 'barrel_lidar_detector', 'mission_controller'],
+            [
+                'ros2',
+                'run',
+                'barrel_lidar_detector',
+                'mission_controller',
+                '--ros-args',
+                '-p',
+                f'expected_barrel_count:={expected_count}',
+            ],
             status_label,
         )
 
-    def start_detectors(self, status_label) -> None:
+    def start_detectors(self, status_label, barrel_count_text: str) -> None:
+        expected_count = self.parse_expected_barrel_count(barrel_count_text, status_label)
+        if expected_count is None:
+            return
+
         self.start_process(
             'lidar_cluster_detector',
             ['ros2', 'run', 'barrel_lidar_detector', 'lidar_cluster_detector'],
@@ -39,9 +55,35 @@ class MissionUIButton(Node):
         )
         self.start_process(
             'map_shape_detector',
-            ['ros2', 'run', 'barrel_lidar_detector', 'map_shape_detector'],
+            [
+                'ros2',
+                'run',
+                'barrel_lidar_detector',
+                'map_shape_detector',
+                '--ros-args',
+                '-p',
+                f'expected_barrel_count:={expected_count}',
+            ],
             status_label,
         )
+
+    @staticmethod
+    def parse_expected_barrel_count(barrel_count_text: str, status_label):
+        value = barrel_count_text.strip()
+        if not value:
+            return 0
+
+        try:
+            count = int(value)
+        except ValueError:
+            status_label.config(text='Expected barrels must be a whole number.', fg='red')
+            return None
+
+        if count < 0:
+            status_label.config(text='Expected barrels cannot be negative.', fg='red')
+            return None
+
+        return count
 
     def stop_detectors(self, status_label) -> None:
         stopped: List[str] = []
@@ -155,13 +197,39 @@ def main(args=None) -> None:
     status_lbl.pack(fill='x', padx=10, pady=(8, 4))
     create_marker_legend(root)
 
+    target_frame = tk.LabelFrame(
+        root,
+        text='Mission target',
+        font=('Arial', 10, 'bold'),
+        padx=8,
+        pady=5,
+    )
+    target_frame.pack(fill='x', padx=10, pady=(0, 8))
+
+    tk.Label(
+        target_frame,
+        text='Expected barrels',
+        anchor='w',
+        font=('Arial', 10),
+    ).pack(side='left')
+
+    expected_barrels_var = tk.StringVar(value='0')
+    tk.Spinbox(
+        target_frame,
+        from_=0,
+        to=20,
+        width=5,
+        textvariable=expected_barrels_var,
+        font=('Arial', 10),
+    ).pack(side='right')
+
     # --- Setup & Detection Frame ---
     btn_controller = tk.Button(root, text='1. Start Mission Controller', font=('Arial', 11, 'bold'), bg='lightgray', fg='black',
-                               command=lambda: node.start_mission_controller(status_lbl))
+                               command=lambda: node.start_mission_controller(status_lbl, expected_barrels_var.get()))
     btn_controller.pack(fill='x', padx=10, pady=2, ipady=8)
 
     btn_detection = tk.Button(root, text='2. Start LiDAR + Map Detection', font=('Arial', 11, 'bold'), bg='deepskyblue', fg='black',
-                              command=lambda: node.start_detectors(status_lbl))
+                              command=lambda: node.start_detectors(status_lbl, expected_barrels_var.get()))
     btn_detection.pack(fill='x', padx=10, pady=2, ipady=8)
 
     btn_stop_detection = tk.Button(root, text='Stop Detection', font=('Arial', 10), bg='gray', fg='white',

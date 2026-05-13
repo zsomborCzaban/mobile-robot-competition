@@ -26,13 +26,11 @@ Nav2.
 Run only the robot stack on the Raspberry Pi. The UI and barrel detector package
 are meant to run on the computer.
 
-Start TurtleBot bringup, RPLiDAR, localization or SLAM, and Nav2 so these exist:
+Start TurtleBot bringup and RPLiDAR so these exist:
 
 ```text
 /scan
-/map
-map -> odom -> base_link/base_footprint -> rplidar_link
-Nav2
+odom -> base_link/base_footprint -> rplidar_link
 ```
 
 The Raspberry Pi and computer must use the same ROS domain:
@@ -40,6 +38,45 @@ The Raspberry Pi and computer must use the same ROS domain:
 ```bash
 source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=<same_as_computer>
+```
+
+## Mapping vs Navigation Launches
+
+`view_robot.launch.py` is only RViz. It lets you see the robot, map, scan, TF,
+and markers, but it does not start Nav2. The `mission_controller` sends goals
+through `nav2_simple_commander`, so Nav2 must be running before pressing
+`START NAVIGATION`.
+
+Use this rule:
+
+- Discovering/mapping barrels: run SLAM plus `view_robot.launch.py`.
+- Executing the route: run Nav2 bringup/localization. Keep RViz open if useful.
+
+On TurtleBot 4 Humble, the normal physical-robot Nav2 command is:
+
+```bash
+ros2 launch turtlebot4_navigation nav_bringup.launch.py \
+  slam:=off localization:=true map:=/full/path/to/map.yaml
+```
+
+Some older TurtleBot 4 setups split that into:
+
+```bash
+ros2 launch turtlebot4_navigation localization.launch.py map:=/full/path/to/map.yaml
+ros2 launch turtlebot4_navigation nav2.launch.py
+```
+
+If your install has a `nav.launch.py` file instead, use it only if it is your
+Nav2 bringup launch file. Do not replace it with `view_robot.launch.py`;
+`view_robot.launch.py` is still just the RViz viewer.
+
+For the navigation phase these must exist:
+
+```text
+/scan
+/map
+map -> odom -> base_link/base_footprint -> rplidar_link
+Nav2 action servers
 ```
 
 ## Computer
@@ -63,13 +100,69 @@ Start the button UI:
 ros2 run barrel_lidar_detector ui_remote
 ```
 
-Press buttons in this order:
+Recommended full workflow:
 
-1. `Start Mission Controller`
-2. `Start LiDAR + Map Detection`
-3. Drive around during SLAM until the barrels are detected and written to YAML.
-4. `Calculate Target Path`
-5. `START NAVIGATION`
+1. On the robot/Raspberry Pi, start the normal TurtleBot 4 robot bringup.
+2. On the computer, start SLAM:
+
+   ```bash
+   ros2 launch turtlebot4_navigation slam.launch.py
+   ```
+
+3. On the computer, start RViz:
+
+   ```bash
+   ros2 launch turtlebot4_viz view_robot.launch.py
+   ```
+
+4. Start the button UI:
+
+   ```bash
+   ros2 run barrel_lidar_detector ui_remote
+   ```
+
+5. Set `Expected barrels` in the UI. Use `0` for unlimited, or enter the
+   exact number of barrels you expect in the arena.
+6. Press `Start Mission Controller`.
+7. Press `Start LiDAR + Map Detection`.
+8. Drive around during SLAM until the full arena is mapped and the barrels are
+   detected. Confirm magenta markers appear and
+   `~/turtlebot4_ws/barrel_target.yaml` contains the barrel entries. If
+   `Expected barrels` is greater than `0`, only the strongest confirmed
+   candidates are kept.
+9. Save the map:
+
+   ```bash
+   ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "name:
+     data: 'arena_map'"
+   ```
+
+10. Stop SLAM, then start Nav2 with the saved map:
+
+    ```bash
+    ros2 launch turtlebot4_navigation nav_bringup.launch.py \
+      slam:=off localization:=true map:=/full/path/to/arena_map.yaml
+    ```
+
+11. In RViz, use `2D Pose Estimate` if localization needs the initial pose.
+12. Press `Calculate Target Path`.
+13. Press `START NAVIGATION`.
+
+The expected barrel count is passed to both `map_shape_detector` and
+`mission_controller`. The detector ranks confirmed barrels by confirmations,
+score, and roundness, then keeps only the strongest N entries. The mission
+controller applies the same limit before planning, so stale extra YAML entries
+are ignored.
+
+Older quick button order:
+
+1. Set `Expected barrels`.
+2. `Start Mission Controller`
+3. `Start LiDAR + Map Detection`
+4. Drive around during SLAM until the barrels are detected and written to YAML.
+5. Start Nav2 with the saved map.
+6. `Calculate Target Path`
+7. `START NAVIGATION`
 
 The UI also exposes pause, resume, and stop/reset controls for the active
 multi-barrel mission.
@@ -157,6 +250,8 @@ barrels:
     map_x: 1.234
     map_y: 2.345
     width: 0.58
+    roundness: 0.91
+    score: 0.86
     confirmations: 5
 ```
 
@@ -164,10 +259,12 @@ Use the same path for both nodes if you override it:
 
 ```bash
 ros2 run barrel_lidar_detector map_shape_detector --ros-args \
-  -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml
+  -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml \
+  -p expected_barrel_count:=3
 
 ros2 run barrel_lidar_detector mission_controller --ros-args \
-  -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml
+  -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml \
+  -p expected_barrel_count:=3
 ```
 
 ## Tuning

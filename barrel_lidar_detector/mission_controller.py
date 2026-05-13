@@ -23,6 +23,7 @@ class BarrelMissionController(Node):
         self.declare_parameter('target_frame', 'map')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('approach_offset', 0.60)
+        self.declare_parameter('expected_barrel_count', 0)
         self.declare_parameter('pose_timeout_sec', 5.0)
         self.declare_parameter(
             'barrel_yaml_path',
@@ -51,7 +52,8 @@ class BarrelMissionController(Node):
 
         self.get_logger().info(
             'Multi-barrel mission controller ready. Barrel YAML: '
-            f'{self.barrel_yaml_path()}'
+            f'{self.barrel_yaml_path()}, expected barrels: '
+            f'{self.expected_barrel_count_label()}'
         )
 
     def calc_callback(self, request, response):
@@ -220,10 +222,48 @@ class BarrelMissionController(Node):
                     'map_x': map_x,
                     'map_y': map_y,
                     'width': width,
+                    'roundness': raw_barrel.get('roundness', 0.0),
+                    'score': raw_barrel.get('score', 0.0),
+                    'confirmations': raw_barrel.get('confirmations', 0),
                 }
             )
 
+        barrels.sort(key=self.barrel_strength, reverse=True)
+        expected_count = self.expected_barrel_count()
+        if expected_count > 0:
+            barrels = barrels[:expected_count]
+
         return barrels
+
+    @staticmethod
+    def barrel_strength(barrel: Dict) -> Tuple[float, float, float]:
+        try:
+            confirmations = float(barrel.get('confirmations', 0.0))
+        except (TypeError, ValueError):
+            confirmations = 0.0
+
+        try:
+            score = float(barrel.get('score', 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+
+        try:
+            roundness = float(barrel.get('roundness', 0.0))
+        except (TypeError, ValueError):
+            roundness = 0.0
+
+        return confirmations, score, roundness
+
+    def expected_barrel_count(self) -> int:
+        try:
+            count = int(self.get_parameter('expected_barrel_count').value)
+        except (TypeError, ValueError):
+            count = 0
+        return max(count, 0)
+
+    def expected_barrel_count_label(self) -> str:
+        count = self.expected_barrel_count()
+        return str(count) if count > 0 else 'unlimited'
 
     def astar_barrel_order(
         self,

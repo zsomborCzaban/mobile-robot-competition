@@ -60,6 +60,7 @@ class MapShapeDetector(Node):
         self.declare_parameter('min_confirmed_minor_major_ratio', 0.55)
         self.declare_parameter('min_confirmed_score', 0.50)
         self.declare_parameter('stable_confirmations', 2)
+        self.declare_parameter('expected_barrel_count', 0)
         self.declare_parameter('confirmation_track_distance', 0.50)
         self.declare_parameter('confirmation_track_timeout_sec', 8.0)
         self.declare_parameter('write_barrel_yaml', True)
@@ -121,7 +122,8 @@ class MapShapeDetector(Node):
         self.get_logger().info(
             f'Map shape detector listening on {self.map_topic}, '
             f'fusing with {self.lidar_pose_topic}. Barrel YAML: '
-            f'{self.barrel_yaml_path()}'
+            f'{self.barrel_yaml_path()}, expected barrels: '
+            f'{self.expected_barrel_count_label()}'
         )
 
     def map_callback(self, grid: OccupancyGrid) -> None:
@@ -632,6 +634,7 @@ class MapShapeDetector(Node):
             data = self.load_barrel_yaml(yaml_path)
             barrels = data.setdefault('barrels', [])
             self.merge_barrel_entry(barrels, track)
+            self.keep_strongest_barrels(barrels)
             self.write_barrel_yaml(yaml_path, data)
             track.last_yaml_write_ns = now_ns
         except (OSError, yaml.YAMLError, ValueError) as exc:
@@ -677,6 +680,8 @@ class MapShapeDetector(Node):
                     'map_x': round(track.x, 3),
                     'map_y': round(track.y, 3),
                     'width': round(track.width, 3),
+                    'roundness': round(track.roundness, 3),
+                    'score': round(track.score, 3),
                     'confirmations': int(track.confirmations),
                 }
             )
@@ -700,7 +705,61 @@ class MapShapeDetector(Node):
             ),
             3,
         )
+        matching_barrel['roundness'] = round(
+            self.blend(
+                float(matching_barrel.get('roundness', track.roundness)),
+                track.roundness,
+                alpha,
+            ),
+            3,
+        )
+        matching_barrel['score'] = round(
+            self.blend(
+                float(matching_barrel.get('score', track.score)),
+                track.score,
+                alpha,
+            ),
+            3,
+        )
         matching_barrel['confirmations'] = previous_confirmations + 1
+
+    def keep_strongest_barrels(self, barrels: List[Dict]) -> None:
+        expected_count = self.expected_barrel_count()
+        if expected_count <= 0 or len(barrels) <= expected_count:
+            return
+
+        barrels.sort(key=self.barrel_strength, reverse=True)
+        del barrels[expected_count:]
+
+    @staticmethod
+    def barrel_strength(barrel: Dict) -> Tuple[float, float, float]:
+        try:
+            confirmations = float(barrel.get('confirmations', 0.0))
+        except (TypeError, ValueError):
+            confirmations = 0.0
+
+        try:
+            score = float(barrel.get('score', 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
+
+        try:
+            roundness = float(barrel.get('roundness', 0.0))
+        except (TypeError, ValueError):
+            roundness = 0.0
+
+        return confirmations, score, roundness
+
+    def expected_barrel_count(self) -> int:
+        try:
+            count = int(self.get_parameter('expected_barrel_count').value)
+        except (TypeError, ValueError):
+            count = 0
+        return max(count, 0)
+
+    def expected_barrel_count_label(self) -> str:
+        count = self.expected_barrel_count()
+        return str(count) if count > 0 else 'unlimited'
 
     @staticmethod
     def closest_yaml_barrel(
