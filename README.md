@@ -23,6 +23,11 @@ drives around. `mission_controller` reads the same YAML file, computes an A*
 visit order through every valid barrel entry, then sends each approach goal to
 Nav2.
 
+Route calculation starts from the robot's current TF pose in `map`. If
+`map -> odom -> base_link` or `map -> odom -> base_footprint` is unavailable,
+the controller refuses to calculate instead of using the map origin as a fake
+start point.
+
 ## Raspberry Pi
 
 Run only the robot stack on the Raspberry Pi. The UI and barrel detector package
@@ -227,6 +232,7 @@ Add barrel displays with `Add -> By topic`:
 /barrel_pose                    PoseStamped
 /barrel_map_pose                PoseStamped
 /barrel_confirmed_pose          PoseStamped
+/mission_status                 String
 ```
 
 Most useful displays:
@@ -236,6 +242,7 @@ Most useful displays:
 - `/barrel_map_candidate_markers`: round objects found in the map.
 - `/barrel_confirmed_marker`: candidate confirmed by LiDAR and map shape.
 - `/barrel_confirmed_pose`: stable pose written into the barrel YAML.
+- `/mission_status`: current mission text, such as `Going to barrel 1/3`.
 
 ## Barrel YAML
 
@@ -302,10 +309,14 @@ ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
   -p min_cluster_range_depth:=0.055 \
   -p min_cluster_circle_radius:=0.08 \
   -p max_cluster_circle_radius:=0.80 \
-  -p track_min_observations:=5 \
-  -p track_min_view_bins:=2 \
-  -p track_max_circle_rmse:=0.08 \
-  -p track_min_line_circle_ratio:=1.25 \
+  -p single_scan_min_line_circle_ratio:=1.15 \
+  -p reject_straight_segments:=true \
+  -p straight_segment_min_length:=0.35 \
+  -p track_min_observations:=3 \
+  -p track_min_view_bins:=1 \
+  -p track_max_circle_rmse:=0.10 \
+  -p track_min_line_circle_ratio:=1.10 \
+  -p track_min_confidence:=0.50 \
   -p cluster_gap:=0.15 \
   -p max_range:=3.0
 ```
@@ -332,7 +343,7 @@ These size limits are intentionally broad because the challenge barrel size may
 change. The main rejection logic is now:
 
 - a curved single-scan LiDAR candidate,
-- a persistent LiDAR track with enough observations and view bins,
+- a persistent LiDAR track with enough observations,
 - accumulated track points fitting a circle better than a straight line,
 - map roundness/corner-fill checks,
 - repeated map/LiDAR confirmation before YAML writes.
@@ -342,7 +353,9 @@ If magenta confirmed markers appear on non-barrels, increase
 `min_confirmed_minor_major_ratio`. If rectangular boxes are marked as barrels,
 lower `max_corner_fill_ratio` or `max_bounding_box_fill_ratio`. If flat objects
 still appear as green LiDAR candidates, increase `min_cluster_arc_depth` or
-`min_cluster_range_depth`. If flat objects reach the yellow/orange LiDAR track,
-increase `track_min_observations`, `track_min_view_bins`, or
+`min_cluster_range_depth`, or increase `single_scan_min_line_circle_ratio`.
+If a box with rounded corners still appears green, lower
+`straight_segment_min_length` slightly. If flat objects reach the yellow/orange
+LiDAR track, increase `track_min_observations`, `track_min_view_bins`, or
 `track_min_line_circle_ratio`. If real barrels are missed, lower those values
-slightly or increase `confirm_distance`.
+slightly, lower `track_min_confidence`, or increase `confirm_distance`.

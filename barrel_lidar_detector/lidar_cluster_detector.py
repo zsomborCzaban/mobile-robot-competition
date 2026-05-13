@@ -86,6 +86,11 @@ class LidarClusterDetector(Node):
         self.declare_parameter('min_cluster_circle_radius', 0.08)
         self.declare_parameter('max_cluster_circle_radius', 0.80)
         self.declare_parameter('max_cluster_circle_fit_error', 0.06)
+        self.declare_parameter('single_scan_min_line_circle_ratio', 1.15)
+        self.declare_parameter('reject_straight_segments', True)
+        self.declare_parameter('straight_segment_min_length', 0.35)
+        self.declare_parameter('straight_segment_max_rmse', 0.012)
+        self.declare_parameter('straight_segment_min_fraction', 0.55)
         self.declare_parameter('min_closest_point_fraction', 0.20)
         self.declare_parameter('max_closest_point_fraction', 0.80)
         self.declare_parameter('front_only', False)
@@ -94,15 +99,15 @@ class LidarClusterDetector(Node):
         self.declare_parameter('use_latest_transform', True)
         self.declare_parameter('track_match_distance', 0.70)
         self.declare_parameter('track_timeout_sec', 12.0)
-        self.declare_parameter('track_publish_timeout_sec', 1.0)
+        self.declare_parameter('track_publish_timeout_sec', 2.0)
         self.declare_parameter('track_max_points', 360)
         self.declare_parameter('track_min_points', 24)
-        self.declare_parameter('track_min_observations', 5)
-        self.declare_parameter('track_min_view_bins', 2)
+        self.declare_parameter('track_min_observations', 3)
+        self.declare_parameter('track_min_view_bins', 1)
         self.declare_parameter('track_view_bin_deg', 45.0)
-        self.declare_parameter('track_max_circle_rmse', 0.08)
-        self.declare_parameter('track_min_line_circle_ratio', 1.25)
-        self.declare_parameter('track_min_confidence', 0.65)
+        self.declare_parameter('track_max_circle_rmse', 0.10)
+        self.declare_parameter('track_min_line_circle_ratio', 1.10)
+        self.declare_parameter('track_min_confidence', 0.50)
 
         self.scan_topic = self.get_parameter('scan_topic').value
         self.target_frame = self.get_parameter('target_frame').value
@@ -161,11 +166,7 @@ class LidarClusterDetector(Node):
         selected_track = self.best_confirmed_track(now_ns)
         if selected_track is None:
             self.publish_delete_selected_marker(self.target_frame)
-            self.get_logger().info(
-                'No /barrel_pose published: waiting for a persistent '
-                'multi-scan circular LiDAR track.',
-                throttle_duration_sec=3.0,
-            )
+            self.log_track_status()
             return
 
         selected_map_pose = self.make_map_pose(
@@ -332,10 +333,61 @@ class LidarClusterDetector(Node):
             self.get_parameter('max_cluster_circle_fit_error').value
         )
 
-        return (
+        if not (
             radius >= min_radius
             and radius <= max_radius
             and fit_error <= max_fit_error
+        ):
+            return False
+
+        line_fit = self.fit_line_points([(point.x, point.y) for point in cluster])
+        if line_fit is None:
+            return False
+
+        min_line_ratio = float(
+            self.get_parameter('single_scan_min_line_circle_ratio').value
+        )
+        line_ratio = line_fit.rmse / max(fit_error, 0.005)
+        if line_ratio < min_line_ratio:
+            return False
+
+        if bool(self.get_parameter('reject_straight_segments').value):
+            if self.has_long_straight_segment(cluster):
+                return False
+
+        return True
+
+    def has_long_straight_segment(self, cluster: List[ScanPoint]) -> bool:
+        min_length = float(self.get_parameter('straight_segment_min_length').value)
+        max_rmse = float(self.get_parameter('straight_segment_max_rmse').value)
+        min_fraction = float(
+            self.get_parameter('straight_segment_min_fraction').value
+        )
+
+        if len(cluster) < 4 or min_length <= 0.0:
+            return False
+
+        best_count = 0
+        best_length = 0.0
+        for start_index in range(len(cluster) - 3):
+            for end_index in range(start_index + 3, len(cluster)):
+                segment = cluster[start_index:end_index + 1]
+                segment_points = [(point.x, point.y) for point in segment]
+                line_fit = self.fit_line_points(segment_points)
+                if line_fit is None or line_fit.rmse > max_rmse:
+                    continue
+
+                length = math.hypot(
+                    segment[-1].x - segment[0].x,
+                    segment[-1].y - segment[0].y,
+                )
+                if length > best_length:
+                    best_length = length
+                    best_count = len(segment)
+
+        return (
+            best_length >= min_length
+            and best_count / len(cluster) >= min_fraction
         )
 
     def lookup_scan_transform(self, scan: LaserScan) -> Optional[PlanarTransform]:
@@ -500,6 +552,28 @@ class LidarClusterDetector(Node):
         return max(
             confirmed_tracks,
             key=lambda track: (track.confidence, track.observations),
+        )
+
+    def log_track_status(self) -> None:
+        if not self.tracks:
+            self.get_logger().info(
+                'No /barrel_pose published: no LiDAR clusters passed the '
+                'curved/non-straight candidate gate.',
+                throttle_duration_sec=3.0,
+            )
+            return
+
+        track = max(
+            self.tracks,
+            key=lambda candidate: (candidate.confidence, candidate.observations),
+        )
+        line_ratio = track.line_rmse / max(track.circle_rmse, 0.005)
+        self.get_logger().info(
+            'No /barrel_pose published: best LiDAR track is not stable enough '
+            f'(obs={track.observations}, views={len(track.view_bins)}, '
+            f'circle_rmse={track.circle_rmse:.3f}, line/circle={line_ratio:.2f}, '
+            f'confidence={track.confidence:.2f}).',
+            throttle_duration_sec=3.0,
         )
 
     def is_confirmed_track(self, track: LidarTrack) -> bool:

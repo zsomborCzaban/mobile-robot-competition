@@ -11,6 +11,7 @@ from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.time import Time
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 import tf2_geometry_msgs  # noqa: F401  Registers geometry_msgs transforms with tf2.
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -24,7 +25,7 @@ class BarrelMissionController(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('approach_offset', 0.15)
         self.declare_parameter('expected_barrel_count', 0)
-        self.declare_parameter('pose_timeout_sec', 5.0)
+        self.declare_parameter('pose_timeout_sec', 1.0)
         self.declare_parameter(
             'barrel_yaml_path',
             '~/turtlebot4_ws/barrel_target.yaml',
@@ -47,6 +48,7 @@ class BarrelMissionController(Node):
         self.create_service(Trigger, 'pause_navigation', self.pause_callback)
         self.create_service(Trigger, 'resume_navigation', self.resume_callback)
         self.create_service(Trigger, 'stop_navigation', self.stop_callback)
+        self.status_pub = self.create_publisher(String, 'mission_status', 10)
 
         self.timer = self.create_timer(0.5, self.control_loop)
 
@@ -76,10 +78,14 @@ class BarrelMissionController(Node):
 
         robot_xy = self.robot_position()
         if robot_xy is None:
-            robot_xy = (0.0, 0.0)
-            self.get_logger().warn(
-                'Robot pose unavailable; using map origin as A* start.'
+            response.success = False
+            response.message = (
+                'Robot pose unavailable; cannot calculate route. Check TF '
+                'map->odom->base_link or map->odom->base_footprint.'
             )
+            self.get_logger().warn(response.message)
+            self.publish_status(response.message)
+            return response
 
         self.ordered_barrels = self.astar_barrel_order(robot_xy, barrels)
         self.waypoints = self.build_waypoints(robot_xy, self.ordered_barrels)
@@ -87,11 +93,15 @@ class BarrelMissionController(Node):
         self.current_waypoint_index = 0
         self.state = 'READY'
         route = ', '.join(str(barrel['id']) for barrel in self.ordered_barrels)
+        first_barrel = str(self.ordered_barrels[0]['id'])
         response.success = True
         response.message = (
-            f'Calculated A* route for {len(self.waypoints)} barrels: {route}'
+            f'Calculated shortest route for {len(self.waypoints)} barrels '
+            f'from robot ({robot_xy[0]:.2f}, {robot_xy[1]:.2f}). '
+            f'First: {first_barrel}. Route: {route}'
         )
         self.get_logger().info(response.message)
+        self.publish_status(response.message)
         return response
 
     def nav_callback(self, request, response):
@@ -104,10 +114,12 @@ class BarrelMissionController(Node):
         self.get_logger().info('Starting navigation through all barrel waypoints.')
         self.navigator.waitUntilNav2Active()
         self.state = 'NAVIGATING'
-        self.send_current_waypoint()
+        waypoint_message = self.send_current_waypoint()
 
         response.success = True
-        response.message = f'Navigation started for {len(self.waypoints)} barrels.'
+        response.message = waypoint_message or (
+            f'Navigation started for {len(self.waypoints)} barrels.'
+        )
         return response
 
     def pause_callback(self, request, response):
@@ -115,6 +127,7 @@ class BarrelMissionController(Node):
             self.navigator.cancelTask()
             self.state = 'PAUSED'
             response.success, response.message = True, 'Robot paused.'
+            self.publish_status(response.message)
         else:
             response.success, response.message = False, 'Not currently navigating.'
         return response
@@ -122,8 +135,9 @@ class BarrelMissionController(Node):
     def resume_callback(self, request, response):
         if self.state == 'PAUSED' and self.waypoints:
             self.state = 'NAVIGATING'
-            self.send_current_waypoint()
-            response.success, response.message = True, 'Resuming navigation.'
+            waypoint_message = self.send_current_waypoint()
+            response.success = True
+            response.message = waypoint_message or 'Resuming navigation.'
         else:
             response.success, response.message = False, 'Robot is not paused.'
         return response
@@ -135,22 +149,28 @@ class BarrelMissionController(Node):
         self.ordered_barrels = []
         self.current_waypoint_index = 0
         response.success, response.message = True, 'Mission stopped and reset.'
+        self.publish_status(response.message)
         return response
 
-    def send_current_waypoint(self):
+    def send_current_waypoint(self) -> Optional[str]:
         if self.current_waypoint_index >= len(self.waypoints):
-            self.get_logger().info('No remaining barrel waypoints.')
+            message = 'No remaining barrel waypoints.'
+            self.get_logger().info(message)
+            self.publish_status(message)
             self.state = 'IDLE'
-            return
+            return message
 
         goal = self.waypoints[self.current_waypoint_index]
         goal.header.stamp = self.get_clock().now().to_msg()
         self.navigator.goToPose(goal)
         barrel = self.ordered_barrels[self.current_waypoint_index]
-        self.get_logger().info(
+        message = (
             f'Going to barrel {self.current_waypoint_index + 1}/'
             f'{len(self.waypoints)}: {barrel["id"]}'
         )
+        self.get_logger().info(message)
+        self.publish_status(message)
+        return message
 
     def control_loop(self):
         if self.state != 'NAVIGATING':
@@ -161,24 +181,36 @@ class BarrelMissionController(Node):
             if result == TaskResult.SUCCEEDED:
                 self.current_waypoint_index += 1
                 if self.current_waypoint_index >= len(self.waypoints):
-                    self.get_logger().info('All barrels reached. Mission complete.')
+                    message = 'All barrels reached. Mission complete.'
+                    self.get_logger().info(message)
+                    self.publish_status(message)
                     self.state = 'IDLE'
                 else:
                     self.send_current_waypoint()
             elif result == TaskResult.CANCELED:
-                self.get_logger().info('Navigation task canceled.')
+                message = 'Navigation task canceled.'
+                self.get_logger().info(message)
+                self.publish_status(message)
                 if self.state == 'NAVIGATING':
                     self.state = 'IDLE'
             elif result == TaskResult.FAILED:
                 barrel = self.ordered_barrels[self.current_waypoint_index]
-                self.get_logger().warn(
+                message = (
                     f'Failed to reach {barrel["id"]}; continuing to next barrel.'
                 )
+                self.get_logger().warn(message)
+                self.publish_status(message)
                 self.current_waypoint_index += 1
                 if self.current_waypoint_index < len(self.waypoints):
                     self.send_current_waypoint()
                 else:
+                    self.publish_status('Mission ended after final failed waypoint.')
                     self.state = 'IDLE'
+
+    def publish_status(self, message: str) -> None:
+        status = String()
+        status.data = message
+        self.status_pub.publish(status)
 
     def barrel_yaml_path(self) -> str:
         return os.path.expanduser(
@@ -300,12 +332,13 @@ class BarrelMissionController(Node):
         start_xy: Tuple[float, float],
         barrels: List[Dict],
     ) -> List[Dict]:
+        route_points = [self.barrel_route_xy(barrel) for barrel in barrels]
         goal_mask = (1 << len(barrels)) - 1
         start_state = (-1, 0)
         best_cost = {start_state: 0.0}
         queue = [
             (
-                self.route_heuristic(-1, 0, start_xy, barrels),
+                self.route_heuristic(-1, 0, start_xy, route_points),
                 0.0,
                 -1,
                 0,
@@ -331,7 +364,7 @@ class BarrelMissionController(Node):
                     current_index,
                     next_index,
                     start_xy,
-                    barrels,
+                    route_points,
                 )
                 next_cost = cost + step_cost
                 next_mask = visited_mask | bit
@@ -344,7 +377,7 @@ class BarrelMissionController(Node):
                     next_index,
                     next_mask,
                     start_xy,
-                    barrels,
+                    route_points,
                 )
                 heapq.heappush(
                     queue,
@@ -364,11 +397,11 @@ class BarrelMissionController(Node):
         current_index: int,
         visited_mask: int,
         start_xy: Tuple[float, float],
-        barrels: List[Dict],
+        route_points: List[Tuple[float, float]],
     ) -> float:
         distances = [
-            self.route_distance(current_index, next_index, start_xy, barrels)
-            for next_index in range(len(barrels))
+            self.route_distance(current_index, next_index, start_xy, route_points)
+            for next_index in range(len(route_points))
             if not visited_mask & (1 << next_index)
         ]
         return min(distances) if distances else 0.0
@@ -378,17 +411,29 @@ class BarrelMissionController(Node):
         current_index: int,
         next_index: int,
         start_xy: Tuple[float, float],
-        barrels: List[Dict],
+        route_points: List[Tuple[float, float]],
     ) -> float:
         if current_index < 0:
             current_x, current_y = start_xy
         else:
-            current_x = barrels[current_index]['map_x']
-            current_y = barrels[current_index]['map_y']
+            current_x, current_y = route_points[current_index]
 
-        next_x = barrels[next_index]['map_x']
-        next_y = barrels[next_index]['map_y']
+        next_x, next_y = route_points[next_index]
         return math.hypot(next_x - current_x, next_y - current_y)
+
+    def barrel_route_xy(self, barrel: Dict) -> Tuple[float, float]:
+        approach_offset = max(
+            float(self.get_parameter('approach_offset').value),
+            0.0,
+        )
+        surface = self.surface_fields(barrel)
+        if surface is not None:
+            return (
+                surface['surface_x'] + surface['normal_x'] * approach_offset,
+                surface['surface_y'] + surface['normal_y'] * approach_offset,
+            )
+
+        return float(barrel['map_x']), float(barrel['map_y'])
 
     def build_waypoints(
         self,
@@ -473,20 +518,42 @@ class BarrelMissionController(Node):
         return pose, (goal_x, goal_y)
 
     def robot_position(self) -> Optional[Tuple[float, float]]:
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.target_frame,
-                self.base_frame,
-                Time(),
-                timeout=Duration(seconds=0.2),
-            )
-        except TransformException as exc:
-            self.get_logger().warn(
-                f'Could not look up robot pose: {exc}',
-                throttle_duration_sec=2.0,
-            )
-            return None
-        return (transform.transform.translation.x, transform.transform.translation.y)
+        timeout_sec = max(float(self.get_parameter('pose_timeout_sec').value), 0.1)
+        last_error = None
+
+        for base_frame in self.base_frame_candidates():
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.target_frame,
+                    base_frame,
+                    Time(),
+                    timeout=Duration(seconds=timeout_sec),
+                )
+                if base_frame != self.base_frame:
+                    self.get_logger().info(
+                        f'Using fallback base frame {base_frame} for route planning.',
+                        throttle_duration_sec=5.0,
+                    )
+                return (
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                )
+            except TransformException as exc:
+                last_error = exc
+
+        self.get_logger().warn(
+            f'Could not look up robot pose in {self.target_frame} using '
+            f'{self.base_frame_candidates()}: {last_error}',
+            throttle_duration_sec=2.0,
+        )
+        return None
+
+    def base_frame_candidates(self) -> List[str]:
+        candidates = [self.base_frame]
+        for frame in ('base_footprint', 'base_link'):
+            if frame not in candidates:
+                candidates.append(frame)
+        return candidates
 
     @staticmethod
     def yaw_to_quaternion(yaw: float) -> Quaternion:

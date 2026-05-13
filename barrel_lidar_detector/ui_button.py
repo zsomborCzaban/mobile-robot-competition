@@ -5,6 +5,7 @@ from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 
@@ -19,6 +20,25 @@ class MissionUIButton(Node):
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
         
         self.processes: Dict[str, subprocess.Popen] = {}
+        self.status_label = None
+        self.create_subscription(
+            String,
+            'mission_status',
+            self.mission_status_callback,
+            10,
+        )
+
+    def set_status_label(self, status_label) -> None:
+        self.status_label = status_label
+
+    def mission_status_callback(self, message: String) -> None:
+        if self.status_label is None:
+            return
+
+        self.status_label.after(
+            0,
+            lambda: self.status_label.config(text=message.data, fg='blue'),
+        )
 
     def start_mission_controller(self, status_label, barrel_count_text: str) -> None:
         if self.cli_calc.wait_for_service(timeout_sec=0.2):
@@ -195,6 +215,7 @@ def main(args=None) -> None:
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
     status_lbl.pack(fill='x', padx=10, pady=(8, 4))
+    node.set_status_label(status_lbl)
     create_marker_legend(root)
 
     target_frame = tk.LabelFrame(
