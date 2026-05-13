@@ -148,32 +148,34 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    root.geometry('390x680')
+    root.geometry('390x640')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
+    status_lbl.pack(fill='x', padx=10, pady=(8, 4))
+    create_marker_legend(root)
 
     # --- Setup & Detection Frame ---
     btn_controller = tk.Button(root, text='1. Start Mission Controller', font=('Arial', 11, 'bold'), bg='lightgray', fg='black',
                                command=lambda: node.start_mission_controller(status_lbl))
-    btn_controller.pack(expand=True, fill='both', padx=10, pady=2)
+    btn_controller.pack(fill='x', padx=10, pady=2, ipady=8)
 
     btn_detection = tk.Button(root, text='2. Start LiDAR + Map Detection', font=('Arial', 11, 'bold'), bg='deepskyblue', fg='black',
                               command=lambda: node.start_detectors(status_lbl))
-    btn_detection.pack(expand=True, fill='both', padx=10, pady=2)
+    btn_detection.pack(fill='x', padx=10, pady=2, ipady=8)
 
     btn_stop_detection = tk.Button(root, text='Stop Detection', font=('Arial', 10), bg='gray', fg='white',
                                    command=lambda: node.stop_detectors(status_lbl))
-    btn_stop_detection.pack(expand=True, fill='both', padx=10, pady=2)
+    btn_stop_detection.pack(fill='x', padx=10, pady=2, ipady=6)
 
     # --- Mission Execution Frame ---
     btn_calc = tk.Button(root, text='3. Calculate Target Path', font=('Arial', 11, 'bold'), bg='orange', fg='black',
                          command=lambda: node.trigger_action(node.cli_calc, "Calculating Target", status_lbl))
-    btn_calc.pack(expand=True, fill='both', padx=10, pady=(15, 2))
+    btn_calc.pack(fill='x', padx=10, pady=(12, 2), ipady=8)
 
     btn_nav = tk.Button(root, text='4. START NAVIGATION', font=('Arial', 12, 'bold'), bg='green', fg='white',
                         command=lambda: node.trigger_action(node.cli_nav, "Starting Navigation", status_lbl))
-    btn_nav.pack(expand=True, fill='both', padx=10, pady=2)
+    btn_nav.pack(fill='x', padx=10, pady=2, ipady=8)
 
     # --- State Machine Controls Frame ---
     control_frame = tk.Frame(root)
@@ -186,10 +188,7 @@ def main(args=None) -> None:
               command=lambda: node.trigger_action(node.cli_res, "Resuming", status_lbl)).pack(side='right', expand=True)
 
     tk.Button(root, text="⏹ STOP & RESET", font=("Arial", 11, "bold"), bg="red", fg="white",
-              command=lambda: node.trigger_action(node.cli_stop, "Stopping Mission", status_lbl)).pack(fill='x', padx=10, pady=2)
-
-    status_lbl.pack(pady=10)
-    create_marker_legend(root)
+              command=lambda: node.trigger_action(node.cli_stop, "Stopping Mission", status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
 
     def on_close() -> None:
         node.stop_child_processes()

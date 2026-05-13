@@ -50,11 +50,12 @@ class MapShapeDetector(Node):
         self.declare_parameter('target_frame', 'map')
         self.declare_parameter('occupied_threshold', 65)
         self.declare_parameter('min_blob_cells', 4)
-        self.declare_parameter('min_blob_diameter', 0.40)
-        self.declare_parameter('max_blob_diameter', 1.00)
+        self.declare_parameter('min_blob_diameter', 0.30)
+        self.declare_parameter('max_blob_diameter', 1.20)
         self.declare_parameter('min_roundness', 0.45)
         self.declare_parameter('min_minor_major_ratio', 0.45)
         self.declare_parameter('confirm_distance', 0.65)
+        self.declare_parameter('fallback_confirm_distance', 0.85)
         self.declare_parameter('lidar_pose_timeout_sec', 3.0)
         self.declare_parameter('lidar_weight', 0.70)
         self.declare_parameter('min_confirmed_roundness', 0.55)
@@ -404,7 +405,20 @@ class MapShapeDetector(Node):
 
     def publish_confirmed_candidate(self) -> None:
         lidar_pose = self.valid_lidar_pose()
-        if lidar_pose is None or not self.map_candidates:
+        if lidar_pose is None:
+            self.get_logger().info(
+                'No magenta marker: waiting for a recent /barrel_pose '
+                'from the LiDAR detector.',
+                throttle_duration_sec=3.0,
+            )
+            self.publish_delete_marker(self.confirmed_marker_pub, 'barrel_confirmed')
+            return
+
+        if not self.map_candidates:
+            self.get_logger().info(
+                'No magenta marker: no round map candidates found in /map.',
+                throttle_duration_sec=3.0,
+            )
             self.publish_delete_marker(self.confirmed_marker_pub, 'barrel_confirmed')
             return
 
@@ -454,30 +468,73 @@ class MapShapeDetector(Node):
 
     def closest_map_candidate(self, lidar_pose: PoseStamped) -> Optional[MapCandidate]:
         confirm_distance = float(self.get_parameter('confirm_distance').value)
+        fallback_confirm_distance = float(
+            self.get_parameter('fallback_confirm_distance').value
+        )
         lidar_x = lidar_pose.pose.position.x
         lidar_y = lidar_pose.pose.position.y
+
+        closest_any = min(
+            self.map_candidates,
+            key=lambda candidate: math.hypot(
+                candidate.center_x - lidar_x,
+                candidate.center_y - lidar_y,
+            ),
+        )
+        closest_any_distance = math.hypot(
+            closest_any.center_x - lidar_x,
+            closest_any.center_y - lidar_y,
+        )
 
         eligible_candidates = [
             candidate
             for candidate in self.map_candidates
             if self.is_confirmable_candidate(candidate)
         ]
+        if eligible_candidates:
+            closest = min(
+                eligible_candidates,
+                key=lambda candidate: math.hypot(
+                    candidate.center_x - lidar_x,
+                    candidate.center_y - lidar_y,
+                ),
+            )
+            distance = math.hypot(closest.center_x - lidar_x, closest.center_y - lidar_y)
+
+            if distance <= confirm_distance:
+                return closest
+
+            self.get_logger().info(
+                'No magenta marker: closest high-quality map candidate is '
+                f'{distance:.2f} m from LiDAR pose, limit is '
+                f'{confirm_distance:.2f} m.',
+                throttle_duration_sec=3.0,
+            )
+
+        if closest_any_distance <= fallback_confirm_distance:
+            self.get_logger().info(
+                'Using spatial fallback for magenta confirmation: closest map '
+                f'candidate is {closest_any_distance:.2f} m from LiDAR pose.',
+                throttle_duration_sec=3.0,
+            )
+            return closest_any
+
         if not eligible_candidates:
-            return None
+            self.get_logger().info(
+                'No magenta marker: map candidates exist, but none pass the '
+                'extra roundness/score confirmation gate. Closest candidate is '
+                f'{closest_any_distance:.2f} m from LiDAR pose.',
+                throttle_duration_sec=3.0,
+            )
+        else:
+            self.get_logger().info(
+                'No magenta marker: closest map candidate is '
+                f'{closest_any_distance:.2f} m from LiDAR pose, fallback limit '
+                f'is {fallback_confirm_distance:.2f} m.',
+                throttle_duration_sec=3.0,
+            )
 
-        closest = min(
-            eligible_candidates,
-            key=lambda candidate: math.hypot(
-                candidate.center_x - lidar_x,
-                candidate.center_y - lidar_y,
-            ),
-        )
-        distance = math.hypot(closest.center_x - lidar_x, closest.center_y - lidar_y)
-
-        if distance > confirm_distance:
-            return None
-
-        return closest
+        return None
 
     def is_confirmable_candidate(self, candidate: MapCandidate) -> bool:
         min_roundness = float(self.get_parameter('min_confirmed_roundness').value)
@@ -555,9 +612,10 @@ class MapShapeDetector(Node):
 
         stable_confirmations = int(self.get_parameter('stable_confirmations').value)
         if matching_track.confirmations < max(stable_confirmations, 1):
-            self.get_logger().debug(
-                'Candidate awaiting stability: '
-                f'{matching_track.confirmations}/{stable_confirmations}'
+            self.get_logger().info(
+                'No magenta marker yet: candidate awaiting stability '
+                f'{matching_track.confirmations}/{stable_confirmations}.',
+                throttle_duration_sec=3.0,
             )
             return None
 

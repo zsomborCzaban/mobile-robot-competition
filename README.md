@@ -190,8 +190,8 @@ ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
 
 ```bash
 ros2 run barrel_lidar_detector map_shape_detector --ros-args \
-  -p min_blob_diameter:=0.40 \
-  -p max_blob_diameter:=1.00 \
+  -p min_blob_diameter:=0.30 \
+  -p max_blob_diameter:=1.20 \
   -p confirm_distance:=0.65 \
   -p stable_confirmations:=2
 ```
