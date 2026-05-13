@@ -6,14 +6,20 @@ It detects barrel candidates without AprilTags:
 
 - `lidar_cluster_detector`: finds object-sized clusters from `/scan`.
 - `map_shape_detector`: finds round blobs in `/map` and confirms them with LiDAR.
-- `mission_controller`: converts the detected barrel pose into a Nav2 goal.
+- `mission_controller`: reads the barrel YAML and sends all approach goals to Nav2.
 - `ui_remote`: button UI for starting detection and navigation.
 
 Main target output:
 
 ```text
 /barrel_confirmed_pose
+~/turtlebot4_ws/barrel_target.yaml
 ```
+
+`map_shape_detector` updates the YAML file while SLAM is running and the robot
+drives around. `mission_controller` reads the same YAML file, computes an A*
+visit order through every valid barrel entry, then sends each approach goal to
+Nav2.
 
 ## Raspberry Pi
 
@@ -61,8 +67,12 @@ Press buttons in this order:
 
 1. `Start Mission Controller`
 2. `Start LiDAR + Map Detection`
-3. `Calculate Target`
-4. `START NAVIGATION`
+3. Drive around during SLAM until the barrels are detected and written to YAML.
+4. `Calculate Target Path`
+5. `START NAVIGATION`
+
+The UI also exposes pause, resume, and stop/reset controls for the active
+multi-barrel mission.
 
 The UI starts detector/controller processes on the computer. That is expected:
 the Raspberry Pi runs the robot stack, while the computer runs this package.
@@ -80,6 +90,9 @@ Then call:
 ```bash
 ros2 service call /calculate_target std_srvs/srv/Trigger
 ros2 service call /start_navigation std_srvs/srv/Trigger
+ros2 service call /pause_navigation std_srvs/srv/Trigger
+ros2 service call /resume_navigation std_srvs/srv/Trigger
+ros2 service call /stop_navigation std_srvs/srv/Trigger
 ```
 
 Start RViz on the computer:
@@ -126,7 +139,36 @@ Most useful displays:
 - `/barrel_candidate_markers`: all LiDAR object candidates.
 - `/barrel_map_candidate_markers`: round objects found in the map.
 - `/barrel_confirmed_marker`: candidate confirmed by LiDAR and map shape.
-- `/barrel_confirmed_pose`: pose used by the mission controller.
+- `/barrel_confirmed_pose`: stable pose written into the barrel YAML.
+
+## Barrel YAML
+
+Default path:
+
+```text
+~/turtlebot4_ws/barrel_target.yaml
+```
+
+The detector creates or updates entries like this:
+
+```yaml
+barrels:
+  - id: Barrel_001
+    map_x: 1.234
+    map_y: 2.345
+    width: 0.58
+    confirmations: 5
+```
+
+Use the same path for both nodes if you override it:
+
+```bash
+ros2 run barrel_lidar_detector map_shape_detector --ros-args \
+  -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml
+
+ros2 run barrel_lidar_detector mission_controller --ros-args \
+  -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml
+```
 
 ## Tuning
 
@@ -150,5 +192,11 @@ ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
 ros2 run barrel_lidar_detector map_shape_detector --ros-args \
   -p min_blob_diameter:=0.40 \
   -p max_blob_diameter:=1.00 \
-  -p confirm_distance:=0.75
+  -p confirm_distance:=0.50 \
+  -p stable_confirmations:=3
 ```
+
+If magenta confirmed markers appear on non-barrels, increase
+`stable_confirmations`, `min_confirmed_roundness`, or
+`min_confirmed_minor_major_ratio`. If real barrels are missed, lower those
+values slightly or increase `confirm_distance`.

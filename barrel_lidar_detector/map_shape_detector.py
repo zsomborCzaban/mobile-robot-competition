@@ -1,7 +1,10 @@
 import math
+import os
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import yaml
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
@@ -26,6 +29,18 @@ class MapCandidate:
     score: float
 
 
+@dataclass
+class ConfirmationTrack:
+    x: float
+    y: float
+    width: float
+    roundness: float
+    score: float
+    confirmations: int
+    last_seen_ns: int
+    last_yaml_write_ns: int = 0
+
+
 class MapShapeDetector(Node):
     def __init__(self) -> None:
         super().__init__('map_shape_detector')
@@ -39,9 +54,22 @@ class MapShapeDetector(Node):
         self.declare_parameter('max_blob_diameter', 1.00)
         self.declare_parameter('min_roundness', 0.45)
         self.declare_parameter('min_minor_major_ratio', 0.45)
-        self.declare_parameter('confirm_distance', 0.75)
+        self.declare_parameter('confirm_distance', 0.50)
         self.declare_parameter('lidar_pose_timeout_sec', 3.0)
         self.declare_parameter('lidar_weight', 0.70)
+        self.declare_parameter('min_confirmed_roundness', 0.65)
+        self.declare_parameter('min_confirmed_minor_major_ratio', 0.70)
+        self.declare_parameter('min_confirmed_score', 0.62)
+        self.declare_parameter('stable_confirmations', 3)
+        self.declare_parameter('confirmation_track_distance', 0.35)
+        self.declare_parameter('confirmation_track_timeout_sec', 8.0)
+        self.declare_parameter('write_barrel_yaml', True)
+        self.declare_parameter(
+            'barrel_yaml_path',
+            '~/turtlebot4_ws/barrel_target.yaml',
+        )
+        self.declare_parameter('yaml_merge_distance', 0.45)
+        self.declare_parameter('yaml_write_period_sec', 1.0)
 
         self.map_topic = self.get_parameter('map_topic').value
         self.lidar_pose_topic = self.get_parameter('lidar_pose_topic').value
@@ -53,6 +81,7 @@ class MapShapeDetector(Node):
         self.map_candidates: List[MapCandidate] = []
         self.latest_lidar_pose: Optional[PoseStamped] = None
         self.latest_lidar_time = None
+        self.confirmation_tracks: List[ConfirmationTrack] = []
 
         self.map_sub = self.create_subscription(
             OccupancyGrid,
@@ -95,7 +124,8 @@ class MapShapeDetector(Node):
 
         self.get_logger().info(
             f'Map shape detector listening on {self.map_topic}, '
-            f'fusing with {self.lidar_pose_topic}'
+            f'fusing with {self.lidar_pose_topic}. Barrel YAML: '
+            f'{self.barrel_yaml_path()}'
         )
 
     def map_callback(self, grid: OccupancyGrid) -> None:
@@ -385,7 +415,14 @@ class MapShapeDetector(Node):
 
         stamp = self.get_clock().now().to_msg()
         fused_pose = self.fuse_pose(lidar_pose, matched_candidate, stamp)
-        self.confirmed_pose_pub.publish(fused_pose)
+        stable_track = self.update_confirmation_track(fused_pose, matched_candidate)
+        if stable_track is None:
+            self.publish_delete_marker(self.confirmed_marker_pub, 'barrel_confirmed')
+            return
+
+        stable_pose = self.make_pose(stable_track.x, stable_track.y, stamp)
+        self.confirmed_pose_pub.publish(stable_pose)
+        self.update_barrel_yaml(stable_track)
 
         marker = self.make_cylinder_marker(
             frame_id=self.target_frame,
@@ -395,7 +432,7 @@ class MapShapeDetector(Node):
             candidate=matched_candidate,
             height=0.55,
         )
-        marker.pose = fused_pose.pose
+        marker.pose = stable_pose.pose
         marker.pose.position.z = 0.28
         marker.color.r = 1.0
         marker.color.g = 0.0
@@ -420,8 +457,16 @@ class MapShapeDetector(Node):
         lidar_x = lidar_pose.pose.position.x
         lidar_y = lidar_pose.pose.position.y
 
+        eligible_candidates = [
+            candidate
+            for candidate in self.map_candidates
+            if self.is_confirmable_candidate(candidate)
+        ]
+        if not eligible_candidates:
+            return None
+
         closest = min(
-            self.map_candidates,
+            eligible_candidates,
             key=lambda candidate: math.hypot(
                 candidate.center_x - lidar_x,
                 candidate.center_y - lidar_y,
@@ -433,6 +478,240 @@ class MapShapeDetector(Node):
             return None
 
         return closest
+
+    def is_confirmable_candidate(self, candidate: MapCandidate) -> bool:
+        min_roundness = float(self.get_parameter('min_confirmed_roundness').value)
+        min_score = float(self.get_parameter('min_confirmed_score').value)
+        min_minor_major_ratio = float(
+            self.get_parameter('min_confirmed_minor_major_ratio').value
+        )
+
+        major = max(candidate.width_x, candidate.width_y)
+        minor = min(candidate.width_x, candidate.width_y)
+        minor_major_ratio = minor / major if major > 0.0 else 0.0
+
+        return (
+            candidate.roundness >= min_roundness
+            and candidate.score >= min_score
+            and minor_major_ratio >= min_minor_major_ratio
+        )
+
+    def update_confirmation_track(
+        self,
+        pose: PoseStamped,
+        candidate: MapCandidate,
+    ) -> Optional[ConfirmationTrack]:
+        now_ns = self.get_clock().now().nanoseconds
+        self.prune_confirmation_tracks(now_ns)
+
+        track_distance = float(
+            self.get_parameter('confirmation_track_distance').value
+        )
+        pose_x = pose.pose.position.x
+        pose_y = pose.pose.position.y
+
+        matching_track = None
+        if self.confirmation_tracks:
+            closest = min(
+                self.confirmation_tracks,
+                key=lambda track: math.hypot(track.x - pose_x, track.y - pose_y),
+            )
+            if math.hypot(closest.x - pose_x, closest.y - pose_y) <= track_distance:
+                matching_track = closest
+
+        if matching_track is None:
+            matching_track = ConfirmationTrack(
+                x=pose_x,
+                y=pose_y,
+                width=candidate.diameter,
+                roundness=candidate.roundness,
+                score=candidate.score,
+                confirmations=1,
+                last_seen_ns=now_ns,
+            )
+            self.confirmation_tracks.append(matching_track)
+        else:
+            next_count = matching_track.confirmations + 1
+            alpha = 1.0 / min(next_count, 8)
+            matching_track.x = self.blend(matching_track.x, pose_x, alpha)
+            matching_track.y = self.blend(matching_track.y, pose_y, alpha)
+            matching_track.width = self.blend(
+                matching_track.width,
+                candidate.diameter,
+                alpha,
+            )
+            matching_track.roundness = self.blend(
+                matching_track.roundness,
+                candidate.roundness,
+                alpha,
+            )
+            matching_track.score = self.blend(
+                matching_track.score,
+                candidate.score,
+                alpha,
+            )
+            matching_track.confirmations = next_count
+            matching_track.last_seen_ns = now_ns
+
+        stable_confirmations = int(self.get_parameter('stable_confirmations').value)
+        if matching_track.confirmations < max(stable_confirmations, 1):
+            self.get_logger().debug(
+                'Candidate awaiting stability: '
+                f'{matching_track.confirmations}/{stable_confirmations}'
+            )
+            return None
+
+        return matching_track
+
+    def prune_confirmation_tracks(self, now_ns: int) -> None:
+        timeout_sec = float(
+            self.get_parameter('confirmation_track_timeout_sec').value
+        )
+        timeout_ns = Duration(seconds=timeout_sec).nanoseconds
+        self.confirmation_tracks = [
+            track
+            for track in self.confirmation_tracks
+            if now_ns - track.last_seen_ns <= timeout_ns
+        ]
+
+    @staticmethod
+    def blend(old_value: float, new_value: float, alpha: float) -> float:
+        return (1.0 - alpha) * old_value + alpha * new_value
+
+    def update_barrel_yaml(self, track: ConfirmationTrack) -> None:
+        if not bool(self.get_parameter('write_barrel_yaml').value):
+            return
+
+        now_ns = self.get_clock().now().nanoseconds
+        write_period_sec = float(self.get_parameter('yaml_write_period_sec').value)
+        if (
+            track.last_yaml_write_ns
+            and now_ns - track.last_yaml_write_ns
+            < Duration(seconds=write_period_sec).nanoseconds
+        ):
+            return
+
+        yaml_path = self.barrel_yaml_path()
+        try:
+            data = self.load_barrel_yaml(yaml_path)
+            barrels = data.setdefault('barrels', [])
+            self.merge_barrel_entry(barrels, track)
+            self.write_barrel_yaml(yaml_path, data)
+            track.last_yaml_write_ns = now_ns
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            self.get_logger().warn(
+                f'Could not update barrel YAML {yaml_path}: {exc}',
+                throttle_duration_sec=2.0,
+            )
+
+    def barrel_yaml_path(self) -> str:
+        return os.path.expanduser(
+            str(self.get_parameter('barrel_yaml_path').value)
+        )
+
+    @staticmethod
+    def load_barrel_yaml(yaml_path: str) -> Dict:
+        if not os.path.exists(yaml_path):
+            return {'barrels': []}
+
+        with open(yaml_path, 'r', encoding='utf-8') as file:
+            data = yaml.safe_load(file) or {}
+
+        if not isinstance(data, dict):
+            raise ValueError('YAML root must be a mapping')
+
+        barrels = data.setdefault('barrels', [])
+        if not isinstance(barrels, list):
+            raise ValueError('YAML "barrels" field must be a list')
+
+        return data
+
+    def merge_barrel_entry(
+        self,
+        barrels: List[Dict],
+        track: ConfirmationTrack,
+    ) -> None:
+        merge_distance = float(self.get_parameter('yaml_merge_distance').value)
+        matching_barrel = self.closest_yaml_barrel(barrels, track, merge_distance)
+
+        if matching_barrel is None:
+            barrels.append(
+                {
+                    'id': self.next_barrel_id(barrels),
+                    'map_x': round(track.x, 3),
+                    'map_y': round(track.y, 3),
+                    'width': round(track.width, 3),
+                    'confirmations': int(track.confirmations),
+                }
+            )
+            return
+
+        previous_confirmations = int(matching_barrel.get('confirmations', 1))
+        alpha = 1.0 / min(previous_confirmations + 1, 20)
+        matching_barrel['map_x'] = round(
+            self.blend(float(matching_barrel['map_x']), track.x, alpha),
+            3,
+        )
+        matching_barrel['map_y'] = round(
+            self.blend(float(matching_barrel['map_y']), track.y, alpha),
+            3,
+        )
+        matching_barrel['width'] = round(
+            self.blend(
+                float(matching_barrel.get('width', track.width)),
+                track.width,
+                alpha,
+            ),
+            3,
+        )
+        matching_barrel['confirmations'] = previous_confirmations + 1
+
+    @staticmethod
+    def closest_yaml_barrel(
+        barrels: List[Dict],
+        track: ConfirmationTrack,
+        merge_distance: float,
+    ) -> Optional[Dict]:
+        closest_barrel = None
+        closest_distance = math.inf
+        for barrel in barrels:
+            try:
+                distance = math.hypot(
+                    float(barrel['map_x']) - track.x,
+                    float(barrel['map_y']) - track.y,
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if distance < closest_distance:
+                closest_barrel = barrel
+                closest_distance = distance
+
+        if closest_distance <= merge_distance:
+            return closest_barrel
+
+        return None
+
+    @staticmethod
+    def next_barrel_id(barrels: List[Dict]) -> str:
+        used_ids = {str(barrel.get('id', '')) for barrel in barrels}
+        index = 1
+        while True:
+            candidate_id = f'Barrel_{index:03d}'
+            if candidate_id not in used_ids:
+                return candidate_id
+            index += 1
+
+    @staticmethod
+    def write_barrel_yaml(yaml_path: str, data: Dict) -> None:
+        directory = os.path.dirname(yaml_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        temp_path = f'{yaml_path}.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as file:
+            yaml.safe_dump(data, file, sort_keys=False)
+        os.replace(temp_path, yaml_path)
 
     def fuse_pose(
         self,
