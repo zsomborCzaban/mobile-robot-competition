@@ -249,11 +249,23 @@ barrels:
   - id: Barrel_001
     map_x: 1.234
     map_y: 2.345
-    width: 0.58
+    width: 0.45
+    surface_x: 1.021
+    surface_y: 2.292
+    normal_x: -0.9701
+    normal_y: -0.2425
     roundness: 0.91
     score: 0.86
-    confirmations: 5
+    confirmations: 6
+    last_seen_unix_sec: 1710000000.0
 ```
+
+`map_x` and `map_y` are the confirmed barrel center. When enough map boundary
+data is available, `surface_x` and `surface_y` are the measured occupied edge
+of the barrel on the confirmed side, and `normal_x`/`normal_y` point outward
+from the barrel center through that edge. The mission controller uses the
+surface fields first, then falls back to center plus `width / 2` for older YAML
+files.
 
 Use the same path for both nodes if you override it:
 
@@ -272,7 +284,7 @@ ros2 run barrel_lidar_detector mission_controller --ros-args \
 Default object size:
 
 ```text
-0.40 m to 1.00 m
+0.30 m to 1.20 m
 ```
 
 Useful parameters:
@@ -289,11 +301,21 @@ ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
 ros2 run barrel_lidar_detector map_shape_detector --ros-args \
   -p min_blob_diameter:=0.30 \
   -p max_blob_diameter:=1.20 \
+  -p max_corner_fill_ratio:=0.35 \
+  -p max_bounding_box_fill_ratio:=0.88 \
+  -p marker_max_diameter:=0.45 \
   -p confirm_distance:=0.65 \
-  -p stable_confirmations:=2
+  -p stable_confirmations:=4
 ```
+
+The mission controller default `approach_offset` is `0.15`. With the generated
+surface fields, the requested goal is `0.15 m` outside the measured barrel edge.
+For older YAML entries without surface fields, it falls back to `width / 2 +
+approach_offset` from the barrel center. If Nav2 still refuses to get that
+close, reduce the Nav2 costmap inflation radius in your Nav2 config.
 
 If magenta confirmed markers appear on non-barrels, increase
 `stable_confirmations`, `min_confirmed_roundness`, or
-`min_confirmed_minor_major_ratio`. If real barrels are missed, lower those
-values slightly or increase `confirm_distance`.
+`min_confirmed_minor_major_ratio`. If rectangular boxes are marked as barrels,
+lower `max_corner_fill_ratio` or `max_bounding_box_fill_ratio`. If real barrels
+are missed, lower those values slightly or increase `confirm_distance`.

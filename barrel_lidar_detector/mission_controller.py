@@ -22,7 +22,7 @@ class BarrelMissionController(Node):
 
         self.declare_parameter('target_frame', 'map')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('approach_offset', 0.60)
+        self.declare_parameter('approach_offset', 0.15)
         self.declare_parameter('expected_barrel_count', 0)
         self.declare_parameter('pose_timeout_sec', 5.0)
         self.declare_parameter(
@@ -216,17 +216,20 @@ class BarrelMissionController(Node):
             if not math.isfinite(width) or width <= 0.0:
                 width = 0.6
 
-            barrels.append(
-                {
-                    'id': str(raw_barrel.get('id', f'Barrel_{index:03d}')),
-                    'map_x': map_x,
-                    'map_y': map_y,
-                    'width': width,
-                    'roundness': raw_barrel.get('roundness', 0.0),
-                    'score': raw_barrel.get('score', 0.0),
-                    'confirmations': raw_barrel.get('confirmations', 0),
-                }
-            )
+            barrel = {
+                'id': str(raw_barrel.get('id', f'Barrel_{index:03d}')),
+                'map_x': map_x,
+                'map_y': map_y,
+                'width': width,
+                'roundness': raw_barrel.get('roundness', 0.0),
+                'score': raw_barrel.get('score', 0.0),
+                'confirmations': raw_barrel.get('confirmations', 0),
+            }
+            surface_fields = self.surface_fields(raw_barrel)
+            if surface_fields is not None:
+                barrel.update(surface_fields)
+
+            barrels.append(barrel)
 
         barrels.sort(key=self.barrel_strength, reverse=True)
         expected_count = self.expected_barrel_count()
@@ -234,6 +237,33 @@ class BarrelMissionController(Node):
             barrels = barrels[:expected_count]
 
         return barrels
+
+    @staticmethod
+    def surface_fields(raw_barrel: Dict) -> Optional[Dict[str, float]]:
+        try:
+            surface_x = float(raw_barrel['surface_x'])
+            surface_y = float(raw_barrel['surface_y'])
+            normal_x = float(raw_barrel['normal_x'])
+            normal_y = float(raw_barrel['normal_y'])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if not all(
+            math.isfinite(value)
+            for value in (surface_x, surface_y, normal_x, normal_y)
+        ):
+            return None
+
+        normal_length = math.hypot(normal_x, normal_y)
+        if normal_length <= 1e-6:
+            return None
+
+        return {
+            'surface_x': surface_x,
+            'surface_y': surface_y,
+            'normal_x': normal_x / normal_length,
+            'normal_y': normal_y / normal_length,
+        }
 
     @staticmethod
     def barrel_strength(barrel: Dict) -> Tuple[float, float, float]:
@@ -382,7 +412,15 @@ class BarrelMissionController(Node):
         barrel_x = float(barrel['map_x'])
         barrel_y = float(barrel['map_y'])
         barrel_width = float(barrel.get('width', 0.6))
-        approach_offset = float(self.get_parameter('approach_offset').value)
+        approach_offset = max(
+            float(self.get_parameter('approach_offset').value),
+            0.0,
+        )
+
+        surface_waypoint = self.surface_waypoint(barrel, approach_offset)
+        if surface_waypoint is not None:
+            return surface_waypoint
+
         total_offset = max(barrel_width, 0.0) * 0.5 + approach_offset
 
         current_x, current_y = current_xy
@@ -398,6 +436,33 @@ class BarrelMissionController(Node):
             goal_y = barrel_y + total_offset * dy / distance
 
         yaw = math.atan2(barrel_y - goal_y, barrel_x - goal_x)
+        pose = PoseStamped()
+        pose.header.frame_id = self.target_frame
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = goal_x
+        pose.pose.position.y = goal_y
+        pose.pose.position.z = 0.0
+        pose.pose.orientation = self.yaw_to_quaternion(yaw)
+        return pose, (goal_x, goal_y)
+
+    def surface_waypoint(
+        self,
+        barrel: Dict,
+        approach_offset: float,
+    ) -> Optional[Tuple[PoseStamped, Tuple[float, float]]]:
+        surface = self.surface_fields(barrel)
+        if surface is None:
+            return None
+
+        surface_x = surface['surface_x']
+        surface_y = surface['surface_y']
+        normal_x = surface['normal_x']
+        normal_y = surface['normal_y']
+
+        goal_x = surface_x + normal_x * approach_offset
+        goal_y = surface_y + normal_y * approach_offset
+        yaw = math.atan2(-normal_y, -normal_x)
+
         pose = PoseStamped()
         pose.header.frame_id = self.target_frame
         pose.header.stamp = self.get_clock().now().to_msg()

@@ -2,15 +2,27 @@ barrels:
   - id: "Barrel_Alpha"
     map_x: 2.0
     map_y: 0.0
-    width: 0.6
+    width: 0.45
+    surface_x: 1.775
+    surface_y: 0.0
+    normal_x: -1.0
+    normal_y: 0.0
     confirmations: 3
   - id: "Barrel_Bravo"
     map_x: 3.5
     map_y: 2.0
-    width: 0.6
+    width: 0.45
+    surface_x: 3.275
+    surface_y: 2.0
+    normal_x: -1.0
+    normal_y: 0.0
     confirmations: 3
   - id: "Barrel_Charlie"
     map_x: 1.0
     map_y: 2.5
-    width: 0.6
+    width: 0.45
+    surface_x: 1.0
+    surface_y: 2.275
+    normal_x: 0.0
+    normal_y: -1.0
     confirmations: 3

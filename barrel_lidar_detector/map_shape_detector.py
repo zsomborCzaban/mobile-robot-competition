@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -21,8 +22,12 @@ class MapCandidate:
     diameter: float
     width_x: float
     width_y: float
+    boundary_points: List[Tuple[float, float]]
     occupied_cells: int
     roundness: float
+    circularity: float
+    corner_fill_ratio: float
+    bounding_box_fill_ratio: float
     fill_ratio: float
     score: float
 
@@ -36,6 +41,10 @@ class ConfirmationTrack:
     score: float
     confirmations: int
     last_seen_ns: int
+    surface_x: Optional[float] = None
+    surface_y: Optional[float] = None
+    normal_x: Optional[float] = None
+    normal_y: Optional[float] = None
     last_yaml_write_ns: int = 0
 
 
@@ -52,15 +61,24 @@ class MapShapeDetector(Node):
         self.declare_parameter('max_blob_diameter', 1.20)
         self.declare_parameter('min_roundness', 0.45)
         self.declare_parameter('min_minor_major_ratio', 0.45)
+        self.declare_parameter('min_circularity', 0.55)
+        self.declare_parameter('max_corner_fill_ratio', 0.35)
+        self.declare_parameter('max_bounding_box_fill_ratio', 0.88)
         self.declare_parameter('confirm_distance', 0.65)
         self.declare_parameter('fallback_confirm_distance', 0.85)
         self.declare_parameter('lidar_pose_timeout_sec', 3.0)
         self.declare_parameter('lidar_weight', 0.70)
         self.declare_parameter('min_confirmed_roundness', 0.55)
         self.declare_parameter('min_confirmed_minor_major_ratio', 0.55)
+        self.declare_parameter('min_confirmed_circularity', 0.55)
+        self.declare_parameter('max_confirmed_corner_fill_ratio', 0.35)
+        self.declare_parameter('max_confirmed_bounding_box_fill_ratio', 0.88)
         self.declare_parameter('min_confirmed_score', 0.50)
-        self.declare_parameter('stable_confirmations', 2)
+        self.declare_parameter('stable_confirmations', 4)
         self.declare_parameter('expected_barrel_count', 0)
+        self.declare_parameter('min_barrel_width', 0.30)
+        self.declare_parameter('max_barrel_width', 0.45)
+        self.declare_parameter('marker_max_diameter', 0.45)
         self.declare_parameter('confirmation_track_distance', 0.50)
         self.declare_parameter('confirmation_track_timeout_sec', 8.0)
         self.declare_parameter('write_barrel_yaml', True)
@@ -70,6 +88,9 @@ class MapShapeDetector(Node):
         )
         self.declare_parameter('yaml_merge_distance', 0.45)
         self.declare_parameter('yaml_write_period_sec', 1.0)
+        self.declare_parameter('yaml_min_confirmations', 4)
+        self.declare_parameter('yaml_stale_timeout_sec', 45.0)
+        self.declare_parameter('yaml_min_persistent_confirmations', 6)
 
         self.map_topic = self.get_parameter('map_topic').value
         self.lidar_pose_topic = self.get_parameter('lidar_pose_topic').value
@@ -223,6 +244,13 @@ class MapShapeDetector(Node):
         min_minor_major_ratio = float(
             self.get_parameter('min_minor_major_ratio').value
         )
+        min_circularity = float(self.get_parameter('min_circularity').value)
+        max_corner_fill_ratio = float(
+            self.get_parameter('max_corner_fill_ratio').value
+        )
+        max_bounding_box_fill_ratio = float(
+            self.get_parameter('max_bounding_box_fill_ratio').value
+        )
 
         xs = [cell[0] for cell in component]
         ys = [cell[1] for cell in component]
@@ -242,9 +270,24 @@ class MapShapeDetector(Node):
         if roundness < min_roundness:
             return None
 
+        circularity = self.component_circularity(component)
+        if circularity < min_circularity:
+            return None
+
+        corner_fill_ratio = self.component_corner_fill_ratio(component)
+        if corner_fill_ratio > max_corner_fill_ratio:
+            return None
+
+        bounding_box_fill_ratio = len(component) / (
+            (max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1)
+        )
+        if bounding_box_fill_ratio > max_bounding_box_fill_ratio:
+            return None
+
         center_cell_x = sum(xs) / len(xs) + 0.5
         center_cell_y = sum(ys) / len(ys) + 0.5
         center_x, center_y = self.cell_to_world(center_cell_x, center_cell_y, grid)
+        boundary_points = self.component_boundary_points(component, grid)
 
         occupied_area = len(component) * resolution * resolution
         expected_circle_area = math.pi * (diameter * 0.5) ** 2
@@ -254,7 +297,14 @@ class MapShapeDetector(Node):
         )
 
         size_score = self.size_score(diameter, min_blob_diameter, max_blob_diameter)
-        score = 0.60 * roundness + 0.25 * size_score + 0.15 * fill_ratio
+        score = (
+            0.35 * roundness
+            + 0.20 * circularity
+            + 0.15 * (1.0 - corner_fill_ratio)
+            + 0.10 * (1.0 - abs(bounding_box_fill_ratio - math.pi / 4.0))
+            + 0.15 * size_score
+            + 0.05 * fill_ratio
+        )
 
         return MapCandidate(
             center_x=center_x,
@@ -262,8 +312,12 @@ class MapShapeDetector(Node):
             diameter=diameter,
             width_x=width_x,
             width_y=width_y,
+            boundary_points=boundary_points,
             occupied_cells=len(component),
             roundness=roundness,
+            circularity=circularity,
+            corner_fill_ratio=corner_fill_ratio,
+            bounding_box_fill_ratio=bounding_box_fill_ratio,
             fill_ratio=fill_ratio,
             score=score,
         )
@@ -291,6 +345,82 @@ class MapShapeDetector(Node):
             return 1.0
 
         return math.sqrt(max(minor_variance, 0.0) / major_variance)
+
+    @staticmethod
+    def component_circularity(component: List[Tuple[int, int]]) -> float:
+        if not component:
+            return 0.0
+
+        cells = set(component)
+        exposed_edges = 0
+        for x, y in cells:
+            for neighbor in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if neighbor not in cells:
+                    exposed_edges += 1
+
+        if exposed_edges == 0:
+            return 0.0
+
+        return min(4.0 * math.pi * len(cells) / (exposed_edges * exposed_edges), 1.0)
+
+    @staticmethod
+    def component_corner_fill_ratio(component: List[Tuple[int, int]]) -> float:
+        if not component:
+            return 1.0
+
+        cells = set(component)
+        xs = [cell[0] for cell in component]
+        ys = [cell[1] for cell in component]
+        min_x = min(xs)
+        max_x = max(xs)
+        min_y = min(ys)
+        max_y = max(ys)
+        width_cells = max_x - min_x + 1
+        height_cells = max_y - min_y + 1
+        corner_width = max(1, math.ceil(width_cells * 0.25))
+        corner_height = max(1, math.ceil(height_cells * 0.25))
+
+        corner_cells = set()
+        x_ranges = (
+            range(min_x, min_x + corner_width),
+            range(max_x - corner_width + 1, max_x + 1),
+        )
+        y_ranges = (
+            range(min_y, min_y + corner_height),
+            range(max_y - corner_height + 1, max_y + 1),
+        )
+
+        for x_range in x_ranges:
+            for y_range in y_ranges:
+                for x in x_range:
+                    for y in y_range:
+                        corner_cells.add((x, y))
+
+        if not corner_cells:
+            return 1.0
+
+        occupied_corner_cells = sum(1 for cell in corner_cells if cell in cells)
+        return occupied_corner_cells / len(corner_cells)
+
+    def component_boundary_points(
+        self,
+        component: List[Tuple[int, int]],
+        grid: OccupancyGrid,
+    ) -> List[Tuple[float, float]]:
+        cells = set(component)
+        boundary_points: List[Tuple[float, float]] = []
+
+        for x, y in component:
+            is_boundary = any(
+                neighbor not in cells
+                for neighbor in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
+            )
+            if not is_boundary:
+                continue
+
+            boundary_points.append(self.cell_to_world(x + 0.5, y + 0.5, grid))
+
+        return boundary_points
 
     @staticmethod
     def size_score(diameter: float, minimum: float, maximum: float) -> float:
@@ -409,7 +539,12 @@ class MapShapeDetector(Node):
 
         stamp = self.get_clock().now().to_msg()
         fused_pose = self.fuse_pose(lidar_pose, matched_candidate, stamp)
-        stable_track = self.update_confirmation_track(fused_pose, matched_candidate)
+        surface = self.candidate_surface_from_lidar(matched_candidate, lidar_pose)
+        stable_track = self.update_confirmation_track(
+            fused_pose,
+            matched_candidate,
+            surface,
+        )
         if stable_track is None:
             self.publish_delete_marker(self.confirmed_marker_pub, 'barrel_confirmed')
             return
@@ -522,6 +657,15 @@ class MapShapeDetector(Node):
         min_minor_major_ratio = float(
             self.get_parameter('min_confirmed_minor_major_ratio').value
         )
+        min_circularity = float(
+            self.get_parameter('min_confirmed_circularity').value
+        )
+        max_corner_fill_ratio = float(
+            self.get_parameter('max_confirmed_corner_fill_ratio').value
+        )
+        max_bounding_box_fill_ratio = float(
+            self.get_parameter('max_confirmed_bounding_box_fill_ratio').value
+        )
 
         major = max(candidate.width_x, candidate.width_y)
         minor = min(candidate.width_x, candidate.width_y)
@@ -530,13 +674,24 @@ class MapShapeDetector(Node):
         return (
             candidate.roundness >= min_roundness
             and candidate.score >= min_score
+            and candidate.circularity >= min_circularity
+            and candidate.corner_fill_ratio <= max_corner_fill_ratio
+            and candidate.bounding_box_fill_ratio <= max_bounding_box_fill_ratio
             and minor_major_ratio >= min_minor_major_ratio
         )
+
+    def candidate_barrel_width(self, candidate: MapCandidate) -> float:
+        min_width = float(self.get_parameter('min_barrel_width').value)
+        max_width = float(self.get_parameter('max_barrel_width').value)
+        if max_width < min_width:
+            max_width = min_width
+        return min(max(candidate.diameter, min_width), max_width)
 
     def update_confirmation_track(
         self,
         pose: PoseStamped,
         candidate: MapCandidate,
+        surface: Optional[Tuple[float, float, float, float]],
     ) -> Optional[ConfirmationTrack]:
         now_ns = self.get_clock().now().nanoseconds
         self.prune_confirmation_tracks(now_ns)
@@ -560,12 +715,13 @@ class MapShapeDetector(Node):
             matching_track = ConfirmationTrack(
                 x=pose_x,
                 y=pose_y,
-                width=candidate.diameter,
+                width=self.candidate_barrel_width(candidate),
                 roundness=candidate.roundness,
                 score=candidate.score,
                 confirmations=1,
                 last_seen_ns=now_ns,
             )
+            self.set_track_surface(matching_track, surface)
             self.confirmation_tracks.append(matching_track)
         else:
             next_count = matching_track.confirmations + 1
@@ -574,7 +730,7 @@ class MapShapeDetector(Node):
             matching_track.y = self.blend(matching_track.y, pose_y, alpha)
             matching_track.width = self.blend(
                 matching_track.width,
-                candidate.diameter,
+                self.candidate_barrel_width(candidate),
                 alpha,
             )
             matching_track.roundness = self.blend(
@@ -589,6 +745,7 @@ class MapShapeDetector(Node):
             )
             matching_track.confirmations = next_count
             matching_track.last_seen_ns = now_ns
+            self.blend_track_surface(matching_track, surface, alpha)
 
         stable_confirmations = int(self.get_parameter('stable_confirmations').value)
         if matching_track.confirmations < max(stable_confirmations, 1):
@@ -600,6 +757,110 @@ class MapShapeDetector(Node):
             return None
 
         return matching_track
+
+    @staticmethod
+    def candidate_surface_from_lidar(
+        candidate: MapCandidate,
+        lidar_pose: PoseStamped,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        if not candidate.boundary_points:
+            return None
+
+        lidar_x = lidar_pose.pose.position.x
+        lidar_y = lidar_pose.pose.position.y
+        direction_x = lidar_x - candidate.center_x
+        direction_y = lidar_y - candidate.center_y
+        direction_length = math.hypot(direction_x, direction_y)
+
+        if direction_length > 1e-6:
+            unit_x = direction_x / direction_length
+            unit_y = direction_y / direction_length
+            surface_x, surface_y = max(
+                candidate.boundary_points,
+                key=lambda point: (
+                    (point[0] - candidate.center_x) * unit_x
+                    + (point[1] - candidate.center_y) * unit_y
+                ),
+            )
+        else:
+            surface_x, surface_y = min(
+                candidate.boundary_points,
+                key=lambda point: math.hypot(point[0] - lidar_x, point[1] - lidar_y),
+            )
+
+        normal_x = surface_x - candidate.center_x
+        normal_y = surface_y - candidate.center_y
+        normal_length = math.hypot(normal_x, normal_y)
+        if normal_length <= 1e-6:
+            return None
+
+        return (
+            surface_x,
+            surface_y,
+            normal_x / normal_length,
+            normal_y / normal_length,
+        )
+
+    @staticmethod
+    def set_track_surface(
+        track: ConfirmationTrack,
+        surface: Optional[Tuple[float, float, float, float]],
+    ) -> None:
+        if surface is None:
+            return
+
+        track.surface_x, track.surface_y, track.normal_x, track.normal_y = surface
+
+    def blend_track_surface(
+        self,
+        track: ConfirmationTrack,
+        surface: Optional[Tuple[float, float, float, float]],
+        alpha: float,
+    ) -> None:
+        if surface is None:
+            return
+
+        if self.track_surface_tuple(track) is None:
+            self.set_track_surface(track, surface)
+            return
+
+        surface_x, surface_y, normal_x, normal_y = surface
+        track.surface_x = self.blend(float(track.surface_x), surface_x, alpha)
+        track.surface_y = self.blend(float(track.surface_y), surface_y, alpha)
+        blended_normal_x = self.blend(float(track.normal_x), normal_x, alpha)
+        blended_normal_y = self.blend(float(track.normal_y), normal_y, alpha)
+        normal_length = math.hypot(blended_normal_x, blended_normal_y)
+        if normal_length <= 1e-6:
+            return
+
+        track.normal_x = blended_normal_x / normal_length
+        track.normal_y = blended_normal_y / normal_length
+
+    @staticmethod
+    def track_surface_tuple(
+        track: ConfirmationTrack,
+    ) -> Optional[Tuple[float, float, float, float]]:
+        values = (track.surface_x, track.surface_y, track.normal_x, track.normal_y)
+        if any(value is None for value in values):
+            return None
+
+        surface_x, surface_y, normal_x, normal_y = (float(value) for value in values)
+        if not all(
+            math.isfinite(value)
+            for value in (surface_x, surface_y, normal_x, normal_y)
+        ):
+            return None
+
+        normal_length = math.hypot(normal_x, normal_y)
+        if normal_length <= 1e-6:
+            return None
+
+        return (
+            surface_x,
+            surface_y,
+            normal_x / normal_length,
+            normal_y / normal_length,
+        )
 
     def prune_confirmation_tracks(self, now_ns: int) -> None:
         timeout_sec = float(
@@ -620,6 +881,12 @@ class MapShapeDetector(Node):
         if not bool(self.get_parameter('write_barrel_yaml').value):
             return
 
+        yaml_min_confirmations = int(
+            self.get_parameter('yaml_min_confirmations').value
+        )
+        if track.confirmations < max(yaml_min_confirmations, 1):
+            return
+
         now_ns = self.get_clock().now().nanoseconds
         write_period_sec = float(self.get_parameter('yaml_write_period_sec').value)
         if (
@@ -633,6 +900,7 @@ class MapShapeDetector(Node):
         try:
             data = self.load_barrel_yaml(yaml_path)
             barrels = data.setdefault('barrels', [])
+            self.prune_weak_stale_barrels(barrels)
             self.merge_barrel_entry(barrels, track)
             self.keep_strongest_barrels(barrels)
             self.write_barrel_yaml(yaml_path, data)
@@ -672,19 +940,21 @@ class MapShapeDetector(Node):
     ) -> None:
         merge_distance = float(self.get_parameter('yaml_merge_distance').value)
         matching_barrel = self.closest_yaml_barrel(barrels, track, merge_distance)
+        now_sec = round(time.time(), 3)
 
         if matching_barrel is None:
-            barrels.append(
-                {
-                    'id': self.next_barrel_id(barrels),
-                    'map_x': round(track.x, 3),
-                    'map_y': round(track.y, 3),
-                    'width': round(track.width, 3),
-                    'roundness': round(track.roundness, 3),
-                    'score': round(track.score, 3),
-                    'confirmations': int(track.confirmations),
-                }
-            )
+            entry = {
+                'id': self.next_barrel_id(barrels),
+                'map_x': round(track.x, 3),
+                'map_y': round(track.y, 3),
+                'width': round(track.width, 3),
+                'roundness': round(track.roundness, 3),
+                'score': round(track.score, 3),
+                'confirmations': int(track.confirmations),
+                'last_seen_unix_sec': now_sec,
+            }
+            self.write_surface_fields(entry, track)
+            barrels.append(entry)
             return
 
         previous_confirmations = int(matching_barrel.get('confirmations', 1))
@@ -722,6 +992,127 @@ class MapShapeDetector(Node):
             3,
         )
         matching_barrel['confirmations'] = previous_confirmations + 1
+        matching_barrel['last_seen_unix_sec'] = now_sec
+        self.write_surface_fields(matching_barrel, track, alpha)
+
+    def write_surface_fields(
+        self,
+        barrel: Dict,
+        track: ConfirmationTrack,
+        alpha: Optional[float] = None,
+    ) -> None:
+        surface = self.track_surface_tuple(track)
+        if surface is None:
+            return
+
+        surface_x, surface_y, normal_x, normal_y = surface
+        if alpha is None:
+            self.set_barrel_surface_fields(
+                barrel,
+                surface_x,
+                surface_y,
+                normal_x,
+                normal_y,
+            )
+            return
+
+        previous_surface = self.barrel_surface_tuple(barrel)
+        if previous_surface is None:
+            self.set_barrel_surface_fields(
+                barrel,
+                surface_x,
+                surface_y,
+                normal_x,
+                normal_y,
+            )
+            return
+
+        old_surface_x, old_surface_y, old_normal_x, old_normal_y = previous_surface
+        blended_normal_x = self.blend(old_normal_x, normal_x, alpha)
+        blended_normal_y = self.blend(old_normal_y, normal_y, alpha)
+        normal_length = math.hypot(blended_normal_x, blended_normal_y)
+        if normal_length <= 1e-6:
+            return
+
+        self.set_barrel_surface_fields(
+            barrel,
+            self.blend(old_surface_x, surface_x, alpha),
+            self.blend(old_surface_y, surface_y, alpha),
+            blended_normal_x / normal_length,
+            blended_normal_y / normal_length,
+        )
+
+    @staticmethod
+    def barrel_surface_tuple(barrel: Dict) -> Optional[Tuple[float, float, float, float]]:
+        try:
+            surface_x = float(barrel['surface_x'])
+            surface_y = float(barrel['surface_y'])
+            normal_x = float(barrel['normal_x'])
+            normal_y = float(barrel['normal_y'])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        if not all(
+            math.isfinite(value)
+            for value in (surface_x, surface_y, normal_x, normal_y)
+        ):
+            return None
+
+        normal_length = math.hypot(normal_x, normal_y)
+        if normal_length <= 1e-6:
+            return None
+
+        return (
+            surface_x,
+            surface_y,
+            normal_x / normal_length,
+            normal_y / normal_length,
+        )
+
+    @staticmethod
+    def set_barrel_surface_fields(
+        barrel: Dict,
+        surface_x: float,
+        surface_y: float,
+        normal_x: float,
+        normal_y: float,
+    ) -> None:
+        barrel['surface_x'] = round(surface_x, 3)
+        barrel['surface_y'] = round(surface_y, 3)
+        barrel['normal_x'] = round(normal_x, 4)
+        barrel['normal_y'] = round(normal_y, 4)
+
+    def prune_weak_stale_barrels(self, barrels: List[Dict]) -> None:
+        stale_timeout_sec = float(self.get_parameter('yaml_stale_timeout_sec').value)
+        min_persistent_confirmations = int(
+            self.get_parameter('yaml_min_persistent_confirmations').value
+        )
+        if stale_timeout_sec <= 0.0:
+            return
+
+        now_sec = time.time()
+        kept_barrels: List[Dict] = []
+        for barrel in barrels:
+            try:
+                confirmations = int(barrel.get('confirmations', 0))
+            except (TypeError, ValueError):
+                confirmations = 0
+
+            try:
+                last_seen_sec = float(barrel.get('last_seen_unix_sec', 0.0))
+            except (TypeError, ValueError):
+                last_seen_sec = 0.0
+
+            is_stale = now_sec - last_seen_sec > stale_timeout_sec
+            is_weak = confirmations < max(min_persistent_confirmations, 1)
+            if is_stale and is_weak:
+                continue
+
+            kept_barrels.append(barrel)
+
+        if len(kept_barrels) != len(barrels):
+            del barrels[:]
+            barrels.extend(kept_barrels)
 
     def keep_strongest_barrels(self, barrels: List[Dict]) -> None:
         expected_count = self.expected_barrel_count()
@@ -832,8 +1223,8 @@ class MapShapeDetector(Node):
         pose.pose.orientation.w = 1.0
         return pose
 
-    @staticmethod
     def make_cylinder_marker(
+        self,
         frame_id: str,
         stamp,
         namespace: str,
@@ -851,10 +1242,15 @@ class MapShapeDetector(Node):
         marker.pose.position.x = candidate.center_x
         marker.pose.position.y = candidate.center_y
         marker.pose.orientation.w = 1.0
-        marker.scale.x = max(candidate.diameter, 0.05)
-        marker.scale.y = max(candidate.diameter, 0.05)
+        marker_diameter = self.marker_diameter(candidate)
+        marker.scale.x = marker_diameter
+        marker.scale.y = marker_diameter
         marker.scale.z = height
         return marker
+
+    def marker_diameter(self, candidate: MapCandidate) -> float:
+        marker_max_diameter = float(self.get_parameter('marker_max_diameter').value)
+        return max(min(candidate.diameter, marker_max_diameter), 0.05)
 
     def publish_delete_marker(self, publisher, namespace: str) -> None:
         marker = Marker()
