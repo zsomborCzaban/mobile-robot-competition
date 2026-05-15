@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'auto_explorer = barrel_lidar_detector.auto_explorer:main',
             'lidar_cluster_detector = barrel_lidar_detector.lidar_cluster_detector:main',
             'map_shape_detector = barrel_lidar_detector.map_shape_detector:main',
             'mission_controller = barrel_lidar_detector.mission_controller:main',

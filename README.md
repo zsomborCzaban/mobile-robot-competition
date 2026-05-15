@@ -8,6 +8,8 @@ It detects barrel candidates without AprilTags:
   publishes `/barrel_pose` only after the accumulated points fit a circle better
   than a straight line.
 - `map_shape_detector`: finds round blobs in `/map` and confirms them with LiDAR.
+- `auto_explorer`: optional SLAM-time driver that reads `/scan` and publishes
+  `/cmd_vel` to move wall-to-wall while avoiding unexpected close obstacles.
 - `mission_controller`: reads the barrel YAML and sends all approach goals to Nav2.
 - `ui_remote`: button UI for starting detection and navigation.
 
@@ -132,8 +134,10 @@ Recommended full workflow:
    exact number of barrels you expect in the arena.
 6. Press `Start Mission Controller`.
 7. Press `Start LiDAR + Map Detection`.
-8. Drive around during SLAM until the full arena is mapped and the barrels are
-   detected. Confirm magenta markers appear and
+8. Explore during SLAM until the full arena is mapped and the barrels are
+   detected. Either drive manually, or press `Start Auto Exploration` to let the
+   robot move from wall to wall using LiDAR. Press `Stop Auto Exploration`
+   before saving the map or switching to Nav2. Confirm magenta markers appear and
    `~/turtlebot4_ws/barrel_target.yaml` contains the barrel entries. If
    `Expected barrels` is greater than `0`, only the strongest confirmed
    candidates are kept.
@@ -166,13 +170,17 @@ Older quick button order:
 1. Set `Expected barrels`.
 2. `Start Mission Controller`
 3. `Start LiDAR + Map Detection`
-4. Drive around during SLAM until the barrels are detected and written to YAML.
+4. Drive manually, or use `Start Auto Exploration`, until the barrels are
+   detected and written to YAML.
 5. Start Nav2 with the saved map.
 6. `Calculate Target Path`
 7. `START NAVIGATION`
 
 The UI also exposes pause, resume, and stop/reset controls for the active
-multi-barrel mission.
+multi-barrel mission. Closing the UI stops child processes that were started by
+that UI instance: the mission controller, detector nodes, and auto explorer. It
+does not stop robot bringup, SLAM, Nav2, or RViz if those were started from
+separate terminals.
 
 The UI starts detector/controller processes on the computer. That is expected:
 the Raspberry Pi runs the robot stack, while the computer runs this package.
@@ -185,9 +193,17 @@ ros2 run barrel_lidar_detector map_shape_detector
 ros2 run barrel_lidar_detector mission_controller
 ```
 
+Optional automatic exploration during SLAM:
+
+```bash
+ros2 run barrel_lidar_detector auto_explorer
+```
+
 Then call:
 
 ```bash
+ros2 service call /start_auto_exploration std_srvs/srv/Trigger
+ros2 service call /stop_auto_exploration std_srvs/srv/Trigger
 ros2 service call /calculate_target std_srvs/srv/Trigger
 ros2 service call /start_navigation std_srvs/srv/Trigger
 ros2 service call /pause_navigation std_srvs/srv/Trigger
@@ -207,6 +223,65 @@ If the UI is missing Tkinter:
 sudo apt install python3-tk
 ```
 
+## ROS 2 Nodes, Topics, and Services
+
+A ROS 2 node is one running program with a name, such as
+`/lidar_cluster_detector` or `/mission_ui_button`. Nodes communicate through
+topics, services, actions, and TF.
+
+Topics are continuous streams. A publisher writes messages to a topic, and any
+subscriber can listen. In this package:
+
+- TurtleBot/RPLiDAR publishes `/scan` (`sensor_msgs/LaserScan`).
+- SLAM publishes `/map` (`nav_msgs/OccupancyGrid`).
+- `auto_explorer` subscribes to `/scan` and publishes `/cmd_vel`
+  (`geometry_msgs/Twist`) to command robot motion.
+- `lidar_cluster_detector` subscribes to `/scan` and publishes `/barrel_pose`
+  plus RViz marker topics.
+- `map_shape_detector` subscribes to `/map` and `/barrel_pose`, then publishes
+  `/barrel_confirmed_pose`, marker topics, and writes the barrel YAML file.
+- `mission_controller` publishes `/mission_status` text for the UI/RViz.
+
+Services are request/response calls. They are useful for buttons because a
+single click asks a node to do one specific thing. This package exposes:
+
+```text
+/start_auto_exploration
+/stop_auto_exploration
+/calculate_target
+/start_navigation
+/pause_navigation
+/resume_navigation
+/stop_navigation
+```
+
+Actions are long-running goals with feedback and results. Nav2 uses actions
+internally; `mission_controller` talks to Nav2 through
+`nav2_simple_commander.BasicNavigator` instead of publishing `/cmd_vel` itself.
+
+TF is the transform tree. It tells nodes where frames are relative to each other:
+`map -> odom -> base_link/base_footprint -> rplidar_link`. The detectors and
+mission controller need TF so LiDAR detections and robot poses can be converted
+into map coordinates.
+
+Useful inspection commands:
+
+```bash
+ros2 node list
+ros2 node info /auto_explorer
+ros2 topic list
+ros2 topic echo /mission_status
+ros2 topic echo /cmd_vel
+ros2 topic hz /scan
+ros2 service list
+ros2 service call /stop_auto_exploration std_srvs/srv/Trigger
+ros2 run tf2_tools view_frames
+```
+
+In RViz, add displays with `Add -> By topic` to see messages visually. For this
+project, the most useful displays are `/scan`, `/map`, TF, and the barrel marker
+topics listed below.
+
 ## RViz
 
 Set `Fixed Frame`:
@@ -220,6 +295,7 @@ Add normal robot displays:
 - `TF`
 - `Map` topic `/map`
 - `LaserScan` topic `/scan`
+- `Twist` topic `/cmd_vel` if you want to watch auto-explorer velocity commands
 
 Add barrel displays with `Add -> By topic`:
 
@@ -243,6 +319,34 @@ Most useful displays:
 - `/barrel_confirmed_marker`: candidate confirmed by LiDAR and map shape.
 - `/barrel_confirmed_pose`: stable pose written into the barrel YAML.
 - `/mission_status`: current mission text, such as `Going to barrel 1/3`.
+
+## Auto Exploration
+
+`auto_explorer` is only for the SLAM/detection phase. It is intentionally
+separate from `mission_controller`, so automatic exploration does not replace
+manual driving or the final Nav2 barrel route.
+
+Default behavior:
+
+- drive forward at `0.12 m/s`,
+- watch a front LiDAR sector,
+- when a wall is detected within `0.38 m`, stop and turn about `165 deg`,
+- if something unexpectedly appears within `0.20 m`, turn `15 deg`,
+- publish zero velocity when stopped, closed, or waiting for fresh scans.
+
+Useful parameters:
+
+```bash
+ros2 run barrel_lidar_detector auto_explorer --ros-args \
+  -p forward_speed:=0.10 \
+  -p front_stop_distance:=0.40 \
+  -p normal_turn_degrees:=165.0 \
+  -p collision_turn_degrees:=15.0
+```
+
+Do not run keyboard teleop and `auto_explorer` at the same time unless you are
+using a velocity multiplexer. Both publish `/cmd_vel`, so they can fight over
+the robot command.
 
 ## Barrel YAML
 

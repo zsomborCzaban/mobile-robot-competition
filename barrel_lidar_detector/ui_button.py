@@ -1,5 +1,8 @@
+import os
+import signal
 import subprocess
 import threading
+import time
 import tkinter as tk
 from typing import Dict, List
 
@@ -18,6 +21,8 @@ class MissionUIButton(Node):
         self.cli_pause = self.create_client(Trigger, 'pause_navigation')
         self.cli_res = self.create_client(Trigger, 'resume_navigation')
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
+        self.cli_auto_start = self.create_client(Trigger, 'start_auto_exploration')
+        self.cli_auto_stop = self.create_client(Trigger, 'stop_auto_exploration')
         
         self.processes: Dict[str, subprocess.Popen] = {}
         self.status_label = None
@@ -108,17 +113,41 @@ class MissionUIButton(Node):
     def stop_detectors(self, status_label) -> None:
         stopped: List[str] = []
         for name in ('lidar_cluster_detector', 'map_shape_detector'):
-            process = self.processes.get(name)
-            if process is None or process.poll() is not None:
-                continue
-
-            process.terminate()
-            stopped.append(name)
+            if self.terminate_process(name):
+                stopped.append(name)
 
         if stopped:
             status_label.config(text='Stopped: ' + ', '.join(stopped), fg='orange')
         else:
             status_label.config(text='No detector process started by this UI.', fg='gray')
+
+    def start_auto_explorer(self, status_label) -> None:
+        self.start_process(
+            'auto_explorer',
+            ['ros2', 'run', 'barrel_lidar_detector', 'auto_explorer'],
+            status_label,
+        )
+        self.trigger_action(
+            self.cli_auto_start,
+            'Starting auto exploration',
+            status_label,
+            timeout_sec=2.0,
+        )
+
+    def stop_auto_explorer(self, status_label) -> None:
+        if not self.cli_auto_stop.wait_for_service(timeout_sec=0.5):
+            if self.terminate_process('auto_explorer'):
+                status_label.config(text='Auto explorer process stopped.', fg='orange')
+            else:
+                status_label.config(text='Auto explorer is not running.', fg='gray')
+            return
+
+        status_label.config(text='Stopping auto exploration...', fg='blue')
+        req = Trigger.Request()
+        future = self.cli_auto_stop.call_async(req)
+        future.add_done_callback(
+            lambda f: self.stop_auto_response_callback(f, status_label)
+        )
 
     def start_process(self, name: str, command: List[str], status_label) -> None:
         process = self.processes.get(name)
@@ -136,8 +165,14 @@ class MissionUIButton(Node):
 
         status_label.config(text=f'Started {name}.', fg='green')
 
-    def trigger_action(self, client, action_name, status_label) -> None:
-        if not client.wait_for_service(timeout_sec=0.5):
+    def trigger_action(
+        self,
+        client,
+        action_name,
+        status_label,
+        timeout_sec: float = 0.5,
+    ) -> None:
+        if not client.wait_for_service(timeout_sec=timeout_sec):
             status_label.config(text=f'Error: Controller offline.', fg='red')
             return
 
@@ -155,10 +190,39 @@ class MissionUIButton(Node):
         except Exception as exc:
             status_label.config(text=f'Service call failed: {exc}', fg='red')
 
+    def stop_auto_response_callback(self, future, status_label) -> None:
+        self.service_response_callback(future, status_label)
+        self.terminate_process('auto_explorer')
+
+    def terminate_process(self, name: str) -> bool:
+        process = self.processes.get(name)
+        if process is None or process.poll() is not None:
+            return False
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            process.terminate()
+
+        deadline = time.monotonic() + 2.0
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                process.kill()
+
+        return True
+
     def stop_child_processes(self) -> None:
-        for process in self.processes.values():
-            if process.poll() is None:
-                process.terminate()
+        for name in list(self.processes):
+            self.terminate_process(name)
 
 
 def run_ros_spin(node: MissionUIButton) -> None:
@@ -210,7 +274,7 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    root.geometry('390x640')
+    root.geometry('390x720')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
@@ -256,6 +320,14 @@ def main(args=None) -> None:
     btn_stop_detection = tk.Button(root, text='Stop Detection', font=('Arial', 10), bg='gray', fg='white',
                                    command=lambda: node.stop_detectors(status_lbl))
     btn_stop_detection.pack(fill='x', padx=10, pady=2, ipady=6)
+
+    btn_auto_start = tk.Button(root, text='Start Auto Exploration', font=('Arial', 11, 'bold'), bg='mediumseagreen', fg='black',
+                               command=lambda: node.start_auto_explorer(status_lbl))
+    btn_auto_start.pack(fill='x', padx=10, pady=(8, 2), ipady=8)
+
+    btn_auto_stop = tk.Button(root, text='Stop Auto Exploration', font=('Arial', 10), bg='darkseagreen', fg='black',
+                              command=lambda: node.stop_auto_explorer(status_lbl))
+    btn_auto_stop.pack(fill='x', padx=10, pady=2, ipady=6)
 
     # --- Mission Execution Frame ---
     btn_calc = tk.Button(root, text='3. Calculate Target Path', font=('Arial', 11, 'bold'), bg='orange', fg='black',
