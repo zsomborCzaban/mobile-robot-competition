@@ -1,0 +1,17 @@
+barrels:
+- id: Barrel_001
+  map_x: -3.965
+  map_y: -1.305
+  width: 0.5
+  roundness: 0.955
+  score: 0.992
+  confirmations: 1
+  last_seen_unix_sec: 1778837440.349
+- id: Barrel_002
+  map_x: -1.615
+  map_y: 1.995
+  width: 0.5
+  roundness: 0.966
+  score: 0.979
+  confirmations: 1
+  last_seen_unix_sec: 1778837440.349

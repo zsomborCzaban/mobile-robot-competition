@@ -2,26 +2,31 @@
 
 ROS 2 Humble package: `barrel_lidar_detector`
 
-It detects barrel candidates without AprilTags:
+It detects barrel targets from the map, without AprilTags or LiDAR barrel
+classification:
 
-- `lidar_cluster_detector`: tracks curved LiDAR clusters over multiple scans and
-  publishes `/barrel_pose` only after the accumulated points fit a circle better
-  than a straight line.
-- `map_shape_detector`: finds round blobs in `/map` and confirms them with LiDAR.
+- `ground_truth_barrel_detector`: reads `/map`, detects circular barrel marks
+  with the same Hough-circle classifier used by the offline marker, writes the
+  barrel YAML, and publishes RViz markers.
 - `mission_controller`: reads the barrel YAML and sends all approach goals to Nav2.
 - `ui_remote`: button UI for starting detection and navigation.
 
 Main target output:
 
 ```text
-/barrel_confirmed_pose
+/barrel_ground_truth_markers
+/barrel_ground_truth_poses
 ~/turtlebot4_ws/barrel_target.yaml
 ```
 
-`map_shape_detector` updates the YAML file while SLAM is running and the robot
-drives around. `mission_controller` reads the same YAML file, computes an A*
-visit order through every valid barrel entry, then sends each approach goal to
-Nav2.
+`ground_truth_barrel_detector` updates the YAML file whenever `/map` changes.
+`mission_controller` reads the same YAML file, computes an A* visit order
+through every valid barrel entry, then sends each approach goal to Nav2.
+
+If you already have a saved map, `offline_barrel_marker` can create the same
+barrel YAML without running the robot. It reads the map YAML/PGM, uses an
+OpenCV Hough-circle classifier to find circular barrel outlines, and can also
+accept manually typed map-frame barrel centers.
 
 Route calculation starts from the robot's current TF pose in `map`. If
 `map -> odom -> base_link` or `map -> odom -> base_footprint` is unavailable,
@@ -131,11 +136,11 @@ Recommended full workflow:
 5. Set `Expected barrels` in the UI. Use `0` for unlimited, or enter the
    exact number of barrels you expect in the arena.
 6. Press `Start Mission Controller`.
-7. Press `Start LiDAR + Map Detection`.
+7. Press `Start Map Barrel Detection`.
 8. Drive around during SLAM until the full arena is mapped and the barrels are
-   detected. Confirm magenta markers appear and
+   detected. Confirm red markers appear and
    `~/turtlebot4_ws/barrel_target.yaml` contains the barrel entries. If
-   `Expected barrels` is greater than `0`, only the strongest confirmed
+   `Expected barrels` is greater than `0`, only the strongest detected
    candidates are kept.
 9. Save the map:
 
@@ -155,17 +160,16 @@ Recommended full workflow:
 12. Press `Calculate Target Path`.
 13. Press `START NAVIGATION`.
 
-The expected barrel count is passed to both `map_shape_detector` and
-`mission_controller`. The detector ranks confirmed barrels by confirmations,
-score, and roundness, then keeps only the strongest N entries. The mission
-controller applies the same limit before planning, so stale extra YAML entries
-are ignored.
+The expected barrel count is passed to both `ground_truth_barrel_detector` and
+`mission_controller`. The detector ranks barrels by classifier score and keeps
+only the strongest N entries when the count is greater than `0`. The mission
+controller applies the same limit before planning.
 
 Older quick button order:
 
 1. Set `Expected barrels`.
 2. `Start Mission Controller`
-3. `Start LiDAR + Map Detection`
+3. `Start Map Barrel Detection`
 4. Drive around during SLAM until the barrels are detected and written to YAML.
 5. Start Nav2 with the saved map.
 6. `Calculate Target Path`
@@ -180,8 +184,7 @@ the Raspberry Pi runs the robot stack, while the computer runs this package.
 Manual workflow instead:
 
 ```bash
-ros2 run barrel_lidar_detector lidar_cluster_detector
-ros2 run barrel_lidar_detector map_shape_detector
+ros2 run barrel_lidar_detector ground_truth_barrel_detector
 ros2 run barrel_lidar_detector mission_controller
 ```
 
@@ -224,24 +227,17 @@ Add normal robot displays:
 Add barrel displays with `Add -> By topic`:
 
 ```text
-/barrel_candidate_markers       MarkerArray
-/barrel_map_candidate_markers   MarkerArray
-/barrel_marker                  Marker
-/barrel_map_marker              Marker
-/barrel_confirmed_marker        Marker
-/barrel_pose                    PoseStamped
-/barrel_map_pose                PoseStamped
+/barrel_ground_truth_markers    MarkerArray
+/barrel_ground_truth_poses      PoseArray
 /barrel_confirmed_pose          PoseStamped
 /mission_status                 String
 ```
 
 Most useful displays:
 
-- `/barrel_candidate_markers`: single-scan curved LiDAR candidates.
-- `/barrel_marker`: stable multi-scan LiDAR barrel track.
-- `/barrel_map_candidate_markers`: round objects found in the map.
-- `/barrel_confirmed_marker`: candidate confirmed by LiDAR and map shape.
-- `/barrel_confirmed_pose`: stable pose written into the barrel YAML.
+- `/barrel_ground_truth_markers`: red cylinders and labels for all map-detected barrels.
+- `/barrel_ground_truth_poses`: pose array for all map-detected barrels.
+- `/barrel_confirmed_pose`: first detected barrel pose for compatibility.
 - `/mission_status`: current mission text, such as `Going to barrel 1/3`.
 
 ## Barrel YAML
@@ -280,7 +276,7 @@ files.
 Use the same path for both nodes if you override it:
 
 ```bash
-ros2 run barrel_lidar_detector map_shape_detector --ros-args \
+ros2 run barrel_lidar_detector ground_truth_barrel_detector --ros-args \
   -p barrel_yaml_path:=/home/ubuntu/turtlebot4_ws/barrel_target.yaml \
   -p expected_barrel_count:=3
 
@@ -289,48 +285,68 @@ ros2 run barrel_lidar_detector mission_controller --ros-args \
   -p expected_barrel_count:=3
 ```
 
+## Offline Barrel Marking
+
+Use this after saving a map if you want to mark barrels without driving the
+robot again:
+
+```bash
+ros2 run barrel_lidar_detector offline_barrel_marker arena_map.yaml \
+  -o ~/turtlebot4_ws/barrel_target.yaml \
+  --annotated-image arena_map_barrels.ppm
+```
+
+The script keeps the map files unchanged. It writes a compatible
+`barrel_target.yaml`; `--annotated-image` is only a color preview image with
+red rings at the selected barrel centers. The script automatically keeps every
+candidate that passes the Hough-circle, square-corner rejection, border
+clearance, confidence, and surrounding free-space filters. It closes/fills
+enclosed black outlines before proposing circles, so a gray or white interior
+inside a black barrel ring can still be detected. It does not assume a fixed
+barrel count or barrel size; use `--count` only when you explicitly want to cap
+the final total including manual entries.
+
+To process every saved map YAML in the current directory and create one barrel
+YAML per map:
+
+```bash
+ros2 run barrel_lidar_detector offline_barrel_marker --all-maps
+```
+
+That writes barrel files to `barrel_targets/` and red preview maps to
+`marked_maps/`.
+
+If automatic map-shape detection misses a barrel, add known map-frame centers
+manually:
+
+```bash
+ros2 run barrel_lidar_detector offline_barrel_marker arena_map.yaml \
+  -o ~/turtlebot4_ws/barrel_target.yaml \
+  --no-auto \
+  --barrel 1.25,0.80 \
+  --barrel 2.10,-1.35
+```
+
+You can mix automatic and manual entries by omitting `--no-auto`. Entries closer
+than `--merge-distance` are merged so a manual correction can replace a nearby
+automatic detection.
+
 ## Tuning
 
-Default object size:
+The detector does not require a fixed barrel size. By default
+`min_diameter:=0.0` and `max_diameter:=0.0`, so the Hough radius range is
+derived from the map image size. Override those only if the map contains many
+non-barrel circles.
 
-```text
-Map blobs: 0.20 m to 1.20 m
-LiDAR clusters: 0.20 m to 1.20 m
-```
-
-Useful parameters:
+Useful detector parameters:
 
 ```bash
-ros2 run barrel_lidar_detector lidar_cluster_detector --ros-args \
-  -p min_cluster_width:=0.20 \
-  -p max_cluster_width:=1.20 \
-  -p require_curved_cluster:=true \
-  -p min_cluster_arc_depth:=0.035 \
-  -p min_cluster_range_depth:=0.055 \
-  -p min_cluster_circle_radius:=0.08 \
-  -p max_cluster_circle_radius:=0.80 \
-  -p single_scan_min_line_circle_ratio:=1.15 \
-  -p reject_straight_segments:=true \
-  -p straight_segment_min_length:=0.35 \
-  -p track_min_observations:=3 \
-  -p track_min_view_bins:=1 \
-  -p track_max_circle_rmse:=0.10 \
-  -p track_min_line_circle_ratio:=1.10 \
-  -p track_min_confidence:=0.50 \
-  -p cluster_gap:=0.15 \
-  -p max_range:=3.0
-```
-
-```bash
-ros2 run barrel_lidar_detector map_shape_detector --ros-args \
-  -p min_blob_diameter:=0.20 \
-  -p max_blob_diameter:=1.20 \
-  -p max_corner_fill_ratio:=0.35 \
-  -p max_bounding_box_fill_ratio:=0.88 \
-  -p allow_spatial_fallback:=false \
-  -p marker_max_diameter:=0.45 \
-  -p confirm_distance:=0.65 \
-  -p stable_confirmations:=4
+ros2 run barrel_lidar_detector ground_truth_barrel_detector --ros-args \
+  -p min_score:=0.55 \
+  -p min_free_ring_ratio:=0.65 \
+  -p min_circle_support_ratio:=0.75 \
+  -p max_square_corner_ratio:=0.36 \
+  -p max_context_occupied_ratio:=0.04
 ```
 
 The mission controller default `approach_offset` is `0.15`. With the generated
@@ -339,23 +355,7 @@ For older YAML entries without surface fields, it falls back to `width / 2 +
 approach_offset` from the barrel center. If Nav2 still refuses to get that
 close, reduce the Nav2 costmap inflation radius in your Nav2 config.
 
-These size limits are intentionally broad because the challenge barrel size may
-change. The main rejection logic is now:
-
-- a curved single-scan LiDAR candidate,
-- a persistent LiDAR track with enough observations,
-- accumulated track points fitting a circle better than a straight line,
-- map roundness/corner-fill checks,
-- repeated map/LiDAR confirmation before YAML writes.
-
-If magenta confirmed markers appear on non-barrels, increase
-`stable_confirmations`, `min_confirmed_roundness`, or
-`min_confirmed_minor_major_ratio`. If rectangular boxes are marked as barrels,
-lower `max_corner_fill_ratio` or `max_bounding_box_fill_ratio`. If flat objects
-still appear as green LiDAR candidates, increase `min_cluster_arc_depth` or
-`min_cluster_range_depth`, or increase `single_scan_min_line_circle_ratio`.
-If a box with rounded corners still appears green, lower
-`straight_segment_min_length` slightly. If flat objects reach the yellow/orange
-LiDAR track, increase `track_min_observations`, `track_min_view_bins`, or
-`track_min_line_circle_ratio`. If real barrels are missed, lower those values
-slightly, lower `track_min_confidence`, or increase `confirm_distance`.
+If red markers appear on non-barrels, increase `min_score`, lower
+`max_square_corner_ratio`, or lower `max_context_occupied_ratio`. If real
+barrels are missed, lower `min_circle_support_ratio` or
+`min_free_ring_ratio`.

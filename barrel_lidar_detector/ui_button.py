@@ -1,5 +1,8 @@
+import os
+import signal
 import subprocess
 import threading
+import time
 import tkinter as tk
 from typing import Dict, List
 
@@ -35,14 +38,15 @@ class MissionUIButton(Node):
         if self.status_label is None:
             return
 
-        self.status_label.after(
-            0,
-            lambda: self.status_label.config(text=message.data, fg='blue'),
-        )
+        self.set_status(self.status_label, message.data, 'blue')
+
+    @staticmethod
+    def set_status(status_label, text: str, color: str) -> None:
+        status_label.after(0, lambda: status_label.config(text=text, fg=color))
 
     def start_mission_controller(self, status_label, barrel_count_text: str) -> None:
         if self.cli_calc.wait_for_service(timeout_sec=0.2):
-            status_label.config(text='Mission controller already running.', fg='green')
+            self.set_status(status_label, 'Mission controller already running.', 'green')
             return
 
         expected_count = self.parse_expected_barrel_count(barrel_count_text, status_label)
@@ -69,17 +73,12 @@ class MissionUIButton(Node):
             return
 
         self.start_process(
-            'lidar_cluster_detector',
-            ['ros2', 'run', 'barrel_lidar_detector', 'lidar_cluster_detector'],
-            status_label,
-        )
-        self.start_process(
-            'map_shape_detector',
+            'ground_truth_barrel_detector',
             [
                 'ros2',
                 'run',
                 'barrel_lidar_detector',
-                'map_shape_detector',
+                'ground_truth_barrel_detector',
                 '--ros-args',
                 '-p',
                 f'expected_barrel_count:={expected_count}',
@@ -87,8 +86,7 @@ class MissionUIButton(Node):
             status_label,
         )
 
-    @staticmethod
-    def parse_expected_barrel_count(barrel_count_text: str, status_label):
+    def parse_expected_barrel_count(self, barrel_count_text: str, status_label):
         value = barrel_count_text.strip()
         if not value:
             return 0
@@ -96,34 +94,38 @@ class MissionUIButton(Node):
         try:
             count = int(value)
         except ValueError:
-            status_label.config(text='Expected barrels must be a whole number.', fg='red')
+            self.set_status(
+                status_label,
+                'Expected barrels must be a whole number.',
+                'red',
+            )
             return None
 
         if count < 0:
-            status_label.config(text='Expected barrels cannot be negative.', fg='red')
+            self.set_status(status_label, 'Expected barrels cannot be negative.', 'red')
             return None
 
         return count
 
     def stop_detectors(self, status_label) -> None:
-        stopped: List[str] = []
-        for name in ('lidar_cluster_detector', 'map_shape_detector'):
-            process = self.processes.get(name)
-            if process is None or process.poll() is not None:
-                continue
-
-            process.terminate()
-            stopped.append(name)
+        stopped = self.stop_named_processes(
+            (
+                'ground_truth_barrel_detector',
+                'lidar_cluster_detector',
+                'map_shape_detector',
+            ),
+            include_stale=True,
+        )
 
         if stopped:
-            status_label.config(text='Stopped: ' + ', '.join(stopped), fg='orange')
+            self.set_status(status_label, 'Stopped: ' + ', '.join(stopped), 'orange')
         else:
-            status_label.config(text='No detector process started by this UI.', fg='gray')
+            self.set_status(status_label, 'No detector process found.', 'gray')
 
     def start_process(self, name: str, command: List[str], status_label) -> None:
         process = self.processes.get(name)
         if process is not None and process.poll() is None:
-            status_label.config(text=f'{name} already running.', fg='green')
+            self.set_status(status_label, f'{name} already running.', 'green')
             return
 
         try:
@@ -131,34 +133,154 @@ class MissionUIButton(Node):
                 command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
             )
         except OSError as exc:
-            status_label.config(text=f'Failed to start {name}: {exc}', fg='red')
+            self.set_status(status_label, f'Failed to start {name}: {exc}', 'red')
             return
 
-        status_label.config(text=f'Started {name}.', fg='green')
+        self.set_status(status_label, f'Started {name}.', 'green')
 
     def trigger_action(self, client, action_name, status_label) -> None:
         if not client.wait_for_service(timeout_sec=0.5):
-            status_label.config(text=f'Error: Controller offline.', fg='red')
+            self.set_status(status_label, 'Error: Controller offline.', 'red')
             return
 
-        status_label.config(text=f'{action_name}...', fg='blue')
+        self.set_status(status_label, f'{action_name}...', 'blue')
         req = Trigger.Request()
         future = client.call_async(req)
         future.add_done_callback(lambda f: self.service_response_callback(f, status_label))
 
-    @staticmethod
-    def service_response_callback(future, status_label) -> None:
+    def service_response_callback(self, future, status_label) -> None:
         try:
             response = future.result()
             color = 'green' if response.success else 'red'
-            status_label.config(text=response.message, fg=color)
+            self.set_status(status_label, response.message, color)
         except Exception as exc:
-            status_label.config(text=f'Service call failed: {exc}', fg='red')
+            self.set_status(status_label, f'Service call failed: {exc}', 'red')
+
+    def stop_all(self, status_label) -> None:
+        self.set_status(status_label, 'Stopping mission and package nodes...', 'orange')
+        cleanup_done = {'value': False}
+
+        def cleanup(message: str) -> None:
+            if cleanup_done['value']:
+                return
+            cleanup_done['value'] = True
+            stopped = self.stop_named_processes(
+                (
+                    'mission_controller',
+                    'ground_truth_barrel_detector',
+                    'lidar_cluster_detector',
+                    'map_shape_detector',
+                ),
+                include_stale=True,
+            )
+            if stopped:
+                message = f'{message} Stopped: {", ".join(stopped)}.'
+            self.set_status(status_label, message, 'orange')
+
+        if self.cli_stop.wait_for_service(timeout_sec=0.3):
+            req = Trigger.Request()
+            future = self.cli_stop.call_async(req)
+
+            def on_stop_done(done_future) -> None:
+                try:
+                    response = done_future.result()
+                    message = response.message
+                except Exception as exc:
+                    message = f'Stop service failed: {exc}'
+
+                status_label.after(0, lambda: cleanup(message))
+
+            future.add_done_callback(on_stop_done)
+            status_label.after(
+                2000,
+                lambda: cleanup('Stop service timed out; forcing package nodes down.'),
+            )
+        else:
+            cleanup('Stop service offline; forcing package nodes down.')
+
+    def stop_named_processes(self, names, include_stale: bool = False) -> List[str]:
+        stopped: List[str] = []
+        for name in names:
+            process = self.processes.pop(name, None)
+            if self.terminate_process_group(process):
+                stopped.append(name)
+
+        if include_stale:
+            for name in names:
+                if self.kill_stale_process(name) and name not in stopped:
+                    stopped.append(name)
+
+        return stopped
+
+    @staticmethod
+    def terminate_process_group(process) -> bool:
+        if process is None or process.poll() is not None:
+            return False
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            process.terminate()
+
+        try:
+            process.wait(timeout=2.0)
+            return True
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            process.kill()
+
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            return False
+
+        return True
+
+    @staticmethod
+    def kill_stale_process(name: str) -> bool:
+        patterns = (
+            f'barrel_lidar_detector.*{name}',
+            f'/barrel_lidar_detector/{name}',
+            f'/{name}( |$)',
+        )
+        killed = False
+        for pattern in patterns:
+            result = subprocess.run(
+                ['pkill', '-TERM', '-f', pattern],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            killed = killed or result.returncode == 0
+        if killed:
+            time.sleep(0.2)
+            for pattern in patterns:
+                subprocess.run(
+                    ['pkill', '-KILL', '-f', pattern],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        return killed
 
     def stop_child_processes(self) -> None:
-        for process in self.processes.values():
-            if process.poll() is None:
-                process.terminate()
+        self.stop_named_processes(
+            (
+                'mission_controller',
+                'ground_truth_barrel_detector',
+                'lidar_cluster_detector',
+                'map_shape_detector',
+            ),
+            include_stale=True,
+        )
 
 
 def run_ros_spin(node: MissionUIButton) -> None:
@@ -194,11 +316,8 @@ def create_marker_legend(root) -> None:
     )
     legend.pack(fill='x', padx=10, pady=(4, 8))
 
-    add_legend_row(legend, '#00cc59', 'Green', 'single-scan curved LiDAR candidates')
-    add_legend_row(legend, '#ff8c00', 'Yellow/orange', 'stable multi-scan LiDAR barrel track')
-    add_legend_row(legend, '#1a73ff', 'Light blue', 'map round-object candidates')
-    add_legend_row(legend, '#0040ff', 'Blue', 'best map candidate')
-    add_legend_row(legend, '#ff00ff', 'Magenta', 'stable confirmed barrel, written to YAML')
+    add_legend_row(legend, '#ff0000', 'Red', 'ground-truth barrels from the map')
+    add_legend_row(legend, '#ffffff', 'White', 'barrel ID labels')
 
 
 def main(args=None) -> None:
@@ -249,7 +368,7 @@ def main(args=None) -> None:
                                command=lambda: node.start_mission_controller(status_lbl, expected_barrels_var.get()))
     btn_controller.pack(fill='x', padx=10, pady=2, ipady=8)
 
-    btn_detection = tk.Button(root, text='2. Start LiDAR + Map Detection', font=('Arial', 11, 'bold'), bg='deepskyblue', fg='black',
+    btn_detection = tk.Button(root, text='2. Start Map Barrel Detection', font=('Arial', 11, 'bold'), bg='deepskyblue', fg='black',
                               command=lambda: node.start_detectors(status_lbl, expected_barrels_var.get()))
     btn_detection.pack(fill='x', padx=10, pady=2, ipady=8)
 
@@ -277,7 +396,7 @@ def main(args=None) -> None:
               command=lambda: node.trigger_action(node.cli_res, "Resuming", status_lbl)).pack(side='right', expand=True)
 
     tk.Button(root, text="⏹ STOP & RESET", font=("Arial", 11, "bold"), bg="red", fg="white",
-              command=lambda: node.trigger_action(node.cli_stop, "Stopping Mission", status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
+              command=lambda: node.stop_all(status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
 
     def on_close() -> None:
         node.stop_child_processes()
