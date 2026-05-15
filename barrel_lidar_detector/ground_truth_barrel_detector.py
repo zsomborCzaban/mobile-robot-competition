@@ -241,6 +241,12 @@ class GroundTruthBarrelDetector(Node):
             min_auxiliary_blob_area=int(
                 self.get_parameter('min_auxiliary_blob_area').value
             ),
+            enable_reference_classifier=bool(
+                self.get_parameter('enable_reference_classifier').value
+            ),
+            reference_classifier_threshold=float(
+                self.get_parameter('reference_classifier_threshold').value
+            ),
             merge_distance=float(self.get_parameter('merge_distance').value),
         )
 

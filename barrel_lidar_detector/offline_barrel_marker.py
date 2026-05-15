@@ -49,6 +49,8 @@ DEFAULT_DETECTOR_PARAMS = {
     'min_auxiliary_score': 0.78,
     'max_auxiliary_blob_diameter': 0.90,
     'min_auxiliary_blob_area': 20,
+    'enable_reference_classifier': True,
+    'reference_classifier_threshold': 0.47,
 }
 
 
@@ -93,6 +95,15 @@ class BarrelCandidate:
     straight_edge_ratio: float
     square_corner_ratio: float
     score: float
+
+
+@dataclass
+class ReferencePatchClassifier:
+    positives: np.ndarray
+    negatives: np.ndarray
+
+
+REFERENCE_CLASSIFIER: Optional[ReferencePatchClassifier] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -349,6 +360,23 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DETECTOR_PARAMS['min_auxiliary_blob_area'],
     )
     parser.add_argument(
+        '--no-reference-classifier',
+        dest='enable_reference_classifier',
+        action='store_false',
+        help='Disable the patch classifier trained from correct_marks_blue examples.',
+    )
+    parser.set_defaults(
+        enable_reference_classifier=(
+            DEFAULT_DETECTOR_PARAMS['enable_reference_classifier']
+        )
+    )
+    parser.add_argument(
+        '--reference-classifier-threshold',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['reference_classifier_threshold'],
+        help='Minimum classifier score when no --count is supplied.',
+    )
+    parser.add_argument(
         '--merge-distance',
         type=float,
         default=DEFAULT_DETECTOR_PARAMS['merge_distance'],
@@ -458,6 +486,15 @@ def detect_barrels(
 ) -> List[BarrelCandidate]:
     args = apply_detection_sensitivity(args)
     candidates = detect_hough_barrels(image, info, args)
+    classifier_candidates = detect_reference_classified_barrels(
+        image,
+        info,
+        args,
+        candidates,
+    )
+    if classifier_candidates:
+        return classifier_candidates
+
     use_auxiliary = (
         bool(getattr(args, 'enable_auxiliary_classifiers', True))
         and (
@@ -492,6 +529,446 @@ def detect_barrels(
     if args.count > 0:
         candidates = candidates[:args.count]
     return candidates
+
+
+def detect_reference_classified_barrels(
+    image: ImageMap,
+    info: MapInfo,
+    args: argparse.Namespace,
+    hough_candidates: List[BarrelCandidate],
+) -> List[BarrelCandidate]:
+    if not bool(getattr(args, 'enable_reference_classifier', True)):
+        return []
+
+    classifier = get_reference_classifier()
+    if classifier is None:
+        return []
+
+    count = int(getattr(args, 'count', 0))
+    permissive_args = argparse.Namespace(**vars(args))
+    permissive_args.min_score = min(float(getattr(args, 'min_score', 0.55)), 0.25)
+    permissive_args.min_auxiliary_score = 0.0
+    permissive_args.max_context_occupied_ratio = max(
+        float(getattr(args, 'max_context_occupied_ratio', 0.04)),
+        0.20,
+    )
+    permissive_args.min_border_clearance = 0.0
+
+    candidates = list(hough_candidates)
+    candidates.extend(detect_auxiliary_barrels(image, info, permissive_args))
+    candidates.extend(detect_relaxed_circle_proposals(image, info, permissive_args))
+    candidates = merge_close_candidates(candidates, max(0.20, args.merge_distance * 0.6))
+
+    ranked: List[BarrelCandidate] = []
+    for candidate in candidates:
+        if candidate.circle_support_ratio < 0.45:
+            continue
+        if (
+            candidate.center_occupied_ratio > 0.95
+            and candidate.square_corner_ratio > 0.15
+        ):
+            continue
+
+        image_x, image_y, radius_cells = candidate_image_circle(candidate, image, info)
+        patch = candidate_patch_feature(image, info, image_x, image_y, radius_cells)
+        if patch is None:
+            continue
+
+        classifier_score = score_reference_patch(classifier, patch)
+        ranked.append(replace_candidate_score(candidate, classifier_score))
+
+    ranked = merge_close_candidates(
+        sorted(ranked, key=lambda candidate: candidate.score, reverse=True),
+        max(args.merge_distance, 0.75),
+    )
+    ranked.sort(key=lambda candidate: candidate.score, reverse=True)
+
+    if count > 0:
+        return ranked[:count]
+
+    threshold = float(
+        getattr(
+            args,
+            'reference_classifier_threshold',
+            DEFAULT_DETECTOR_PARAMS['reference_classifier_threshold'],
+        )
+    )
+    return [candidate for candidate in ranked if candidate.score >= threshold]
+
+
+def get_reference_classifier() -> Optional[ReferencePatchClassifier]:
+    global REFERENCE_CLASSIFIER
+    if REFERENCE_CLASSIFIER is not None:
+        return REFERENCE_CLASSIFIER
+
+    root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    reference_dir = os.path.join(root_dir, 'correct_marks_blue')
+    if not os.path.isdir(reference_dir):
+        return None
+
+    positives: List[np.ndarray] = []
+    negatives: List[np.ndarray] = []
+    for reference_name in sorted(os.listdir(reference_dir)):
+        reference_path = os.path.join(reference_dir, reference_name)
+        map_path = reference_map_path(root_dir, reference_name)
+        if map_path is None or not os.path.exists(map_path):
+            continue
+
+        blue_circles = extract_blue_reference_circles(reference_path)
+        if not blue_circles:
+            continue
+
+        info = reference_map_info(root_dir, map_path)
+        image = load_pgm(map_path)
+        for image_x, image_y, radius_cells in blue_circles:
+            for offset_x, offset_y in (
+                (0, 0),
+                (-8, 0),
+                (8, 0),
+                (0, -8),
+                (0, 8),
+                (-8, 6),
+                (8, -6),
+            ):
+                feature = candidate_patch_feature(
+                    image,
+                    info,
+                    image_x + offset_x,
+                    image_y + offset_y,
+                    radius_cells,
+                )
+                if feature is not None:
+                    positives.append(feature)
+
+        train_args = argparse.Namespace(**DEFAULT_DETECTOR_PARAMS)
+        train_args.detection_sensitivity = 100.0
+        train_args.count = 0
+        train_args.merge_distance = 0.25
+        train_args.min_score = 0.25
+        train_args.min_auxiliary_score = 0.0
+        train_args.max_context_occupied_ratio = 0.20
+        train_args.min_border_clearance = 0.0
+        proposals = detect_hough_barrels(image, info, train_args)
+        proposals.extend(detect_auxiliary_barrels(image, info, train_args))
+        proposals.extend(detect_relaxed_circle_proposals(image, info, train_args))
+        proposals = merge_close_candidates(proposals, train_args.merge_distance)
+
+        positive_radius = max(14.0, 0.55 / info.resolution)
+        negative_radius = max(22.0, 0.85 / info.resolution)
+        for proposal in proposals:
+            image_x, image_y, radius_cells = candidate_image_circle(
+                proposal,
+                image,
+                info,
+            )
+            closest_reference = min(
+                math.hypot(image_x - ref_x, image_y - ref_y)
+                for ref_x, ref_y, _ in blue_circles
+            )
+            feature = candidate_patch_feature(
+                image,
+                info,
+                image_x,
+                image_y,
+                radius_cells,
+            )
+            if feature is None:
+                continue
+            if closest_reference <= positive_radius:
+                positives.append(feature)
+            elif closest_reference >= negative_radius:
+                negatives.append(feature)
+
+    if len(positives) < 3 or len(negatives) < 3:
+        return None
+
+    REFERENCE_CLASSIFIER = ReferencePatchClassifier(
+        positives=np.stack(positives).astype(np.float32),
+        negatives=np.stack(negatives).astype(np.float32),
+    )
+    return REFERENCE_CLASSIFIER
+
+
+def reference_map_path(root_dir: str, reference_name: str) -> Optional[str]:
+    if reference_name.endswith('_barrels.ppm'):
+        map_name = f'{reference_name[:-len("_barrels.ppm")]}.pgm'
+    else:
+        map_name = reference_name
+    map_path = os.path.join(root_dir, map_name)
+    return map_path if os.path.exists(map_path) else None
+
+
+def reference_map_info(root_dir: str, map_path: str) -> MapInfo:
+    stem = os.path.splitext(os.path.basename(map_path))[0]
+    yaml_path = os.path.join(root_dir, f'{stem}.yaml')
+    if os.path.exists(yaml_path):
+        info = load_map_info(yaml_path)
+    else:
+        info = MapInfo(
+            image_path=map_path,
+            resolution=0.05,
+            origin_x=0.0,
+            origin_y=0.0,
+            origin_yaw=0.0,
+            negate=0,
+            occupied_thresh=0.65,
+            free_thresh=0.25,
+        )
+    info.occupied_thresh = 0.50
+    info.free_thresh = 0.25
+    return info
+
+
+def extract_blue_reference_circles(path: str) -> List[Tuple[int, int, int]]:
+    reference_image = cv2.imread(path, cv2.IMREAD_COLOR)
+    if reference_image is None:
+        return []
+
+    blue_mask = cv2.inRange(
+        reference_image,
+        np.array([120, 0, 0], dtype=np.uint8),
+        np.array([255, 150, 150], dtype=np.uint8),
+    )
+    circles = cv2.HoughCircles(
+        cv2.medianBlur(blue_mask, 5),
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=25,
+        param1=50,
+        param2=20,
+        minRadius=5,
+        maxRadius=60,
+    )
+    if circles is None:
+        return []
+
+    return [
+        (int(image_x), int(image_y), int(radius_cells))
+        for image_x, image_y, radius_cells in np.round(circles[0, :]).astype(int)
+    ]
+
+
+def detect_relaxed_circle_proposals(
+    image: ImageMap,
+    info: MapInfo,
+    args: argparse.Namespace,
+) -> List[BarrelCandidate]:
+    grayscale = np.array(image.pixels, dtype=np.uint8).reshape(
+        (image.height, image.width)
+    )
+    occupied_image = 255 - grayscale if not info.negate else grayscale
+    _, occupied_mask = cv2.threshold(occupied_image, 127, 255, cv2.THRESH_BINARY)
+    proposal_images = [
+        cv2.medianBlur(occupied_image, 5),
+        cv2.Canny(occupied_image, 50, 150),
+        cv2.medianBlur(occupied_mask, 5),
+    ]
+    min_radius, max_radius = hough_radius_range(image, info, args)
+    max_radius = min(max_radius, max(8, int(round(0.80 / info.resolution))))
+    candidates: List[BarrelCandidate] = []
+    for proposal_image in proposal_images:
+        for hough_param2 in (5.0, 8.0, 12.0):
+            circles = cv2.HoughCircles(
+                proposal_image,
+                cv2.HOUGH_GRADIENT,
+                dp=1.1,
+                minDist=max(8, int(round(0.20 / info.resolution))),
+                param1=80,
+                param2=hough_param2,
+                minRadius=min_radius,
+                maxRadius=max_radius,
+            )
+            if circles is None:
+                continue
+
+            for image_x, image_y, radius_cells in np.round(circles[0, :]).astype(int):
+                candidate = relaxed_circle_to_candidate(
+                    int(image_x),
+                    int(image_y),
+                    int(radius_cells),
+                    image,
+                    info,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+
+    return merge_close_candidates(candidates, max(0.20, args.merge_distance * 0.6))
+
+
+def relaxed_circle_to_candidate(
+    image_x: int,
+    image_y: int,
+    radius_cells: int,
+    image: ImageMap,
+    info: MapInfo,
+) -> Optional[BarrelCandidate]:
+    if radius_cells < 1:
+        return None
+    if image_x < 0 or image_x >= image.width or image_y < 0 or image_y >= image.height:
+        return None
+
+    map_cell_y = image.height - 1 - image_y
+    diameter = 2.0 * radius_cells * info.resolution
+    center_x, center_y = cell_to_world(image_x + 0.5, map_cell_y + 0.5, info)
+    support, center_occupied_ratio = hough_circle_template_ratios(
+        image_x,
+        image_y,
+        radius_cells,
+        image,
+        info,
+    )
+    free_ring, occupied_ring, unknown_ring = hough_free_ring_ratios(
+        image_x,
+        image_y,
+        radius_cells,
+        image,
+        info,
+    )
+    context_occupied, _, _ = hough_context_occupied_metrics(
+        image_x,
+        image_y,
+        radius_cells,
+        image,
+        info,
+    )
+    square_corner_ratio = hough_square_corner_ratio(
+        image_x,
+        image_y,
+        radius_cells,
+        image,
+        info,
+    )
+    score = (
+        0.35 * support
+        + 0.20 * (1.0 - center_occupied_ratio)
+        + 0.20 * free_ring
+        + 0.15 * (1.0 - square_corner_ratio)
+        - 0.10 * occupied_ring
+        - 0.10 * context_occupied
+    )
+    return BarrelCandidate(
+        center_x=center_x,
+        center_y=center_y,
+        diameter=diameter,
+        width_x=diameter,
+        width_y=diameter,
+        occupied_cells=0,
+        roundness=support,
+        circularity=support,
+        corner_fill_ratio=square_corner_ratio,
+        bounding_box_fill_ratio=0.0,
+        fill_ratio=1.0 - center_occupied_ratio,
+        free_ring_ratio=free_ring,
+        occupied_ring_ratio=occupied_ring,
+        unknown_ring_ratio=unknown_ring,
+        circle_support_ratio=support,
+        center_occupied_ratio=center_occupied_ratio,
+        radial_cv=0.0,
+        straight_edge_ratio=0.0,
+        square_corner_ratio=square_corner_ratio,
+        score=score,
+    )
+
+
+def candidate_image_circle(
+    candidate: BarrelCandidate,
+    image: ImageMap,
+    info: MapInfo,
+) -> Tuple[int, int, float]:
+    cell_x, cell_y = world_to_cell(candidate.center_x, candidate.center_y, info)
+    image_y = image.height - 1 - cell_y
+    radius_cells = max(3.0, 0.5 * candidate.diameter / info.resolution)
+    return cell_x, image_y, radius_cells
+
+
+def candidate_patch_feature(
+    image: ImageMap,
+    info: MapInfo,
+    image_x: float,
+    image_y: float,
+    radius_cells: float,
+) -> Optional[np.ndarray]:
+    grayscale = np.array(image.pixels, dtype=np.uint8).reshape(
+        (image.height, image.width)
+    )
+    occupied_image = 255 - grayscale if not info.negate else grayscale
+    occupied_image = occupied_image.astype(np.float32) / 255.0
+    side = max(18, int(round(max(4.0, radius_cells) * 4.0)))
+    half_side = 0.5 * side
+    x0 = max(0, int(round(image_x - half_side)))
+    x1 = min(image.width, int(round(image_x + half_side)))
+    y0 = max(0, int(round(image_y - half_side)))
+    y1 = min(image.height, int(round(image_y + half_side)))
+    if x1 <= x0 or y1 <= y0:
+        return None
+
+    crop = occupied_image[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+
+    resized = cv2.resize(crop, (24, 24), interpolation=cv2.INTER_AREA)
+    gradient_x = cv2.Sobel(resized, cv2.CV_32F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(resized, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = np.sqrt(gradient_x * gradient_x + gradient_y * gradient_y)
+    extras = np.array(
+        [
+            float(resized.mean()),
+            float(resized.std()),
+            float((resized > 0.5).mean()),
+        ],
+        dtype=np.float32,
+    )
+    feature = np.concatenate(
+        [resized.reshape(-1), gradient.reshape(-1), extras]
+    ).astype(np.float32)
+    feature = (feature - feature.mean()) / (feature.std() + 1e-6)
+    norm = float(np.linalg.norm(feature))
+    if norm <= 1e-6:
+        return None
+    return feature / norm
+
+
+def score_reference_patch(
+    classifier: ReferencePatchClassifier,
+    feature: np.ndarray,
+) -> float:
+    positive_count = min(5, len(classifier.positives))
+    negative_count = min(5, len(classifier.negatives))
+    positive_similarity = float(
+        np.sort(classifier.positives @ feature)[-positive_count:].mean()
+    )
+    negative_similarity = float(
+        np.sort(classifier.negatives @ feature)[-negative_count:].mean()
+    )
+    return clamp(0.5 + 0.8 * (positive_similarity - negative_similarity), 0.0, 1.0)
+
+
+def replace_candidate_score(
+    candidate: BarrelCandidate,
+    score: float,
+) -> BarrelCandidate:
+    return BarrelCandidate(
+        center_x=candidate.center_x,
+        center_y=candidate.center_y,
+        diameter=candidate.diameter,
+        width_x=candidate.width_x,
+        width_y=candidate.width_y,
+        occupied_cells=candidate.occupied_cells,
+        roundness=candidate.roundness,
+        circularity=candidate.circularity,
+        corner_fill_ratio=candidate.corner_fill_ratio,
+        bounding_box_fill_ratio=candidate.bounding_box_fill_ratio,
+        fill_ratio=candidate.fill_ratio,
+        free_ring_ratio=candidate.free_ring_ratio,
+        occupied_ring_ratio=candidate.occupied_ring_ratio,
+        unknown_ring_ratio=candidate.unknown_ring_ratio,
+        circle_support_ratio=candidate.circle_support_ratio,
+        center_occupied_ratio=candidate.center_occupied_ratio,
+        radial_cv=candidate.radial_cv,
+        straight_edge_ratio=candidate.straight_edge_ratio,
+        square_corner_ratio=candidate.square_corner_ratio,
+        score=score,
+    )
 
 
 def apply_detection_sensitivity(args: argparse.Namespace) -> argparse.Namespace:
