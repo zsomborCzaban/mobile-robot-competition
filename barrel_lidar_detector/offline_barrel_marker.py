@@ -45,6 +45,10 @@ DEFAULT_DETECTOR_PARAMS = {
     'max_wall_touch_occupied_ring_ratio': 0.45,
     'max_wall_touch_angle_ratio': 0.45,
     'min_wall_touch_longest_run_ratio': 0.60,
+    'enable_auxiliary_classifiers': True,
+    'min_auxiliary_score': 0.78,
+    'max_auxiliary_blob_diameter': 0.90,
+    'min_auxiliary_blob_area': 20,
 }
 
 
@@ -319,6 +323,32 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DETECTOR_PARAMS['min_wall_touch_longest_run_ratio'],
     )
     parser.add_argument(
+        '--no-auxiliary-classifiers',
+        dest='enable_auxiliary_classifiers',
+        action='store_false',
+        help='Disable contour/template auxiliary barrel classifiers.',
+    )
+    parser.set_defaults(
+        enable_auxiliary_classifiers=(
+            DEFAULT_DETECTOR_PARAMS['enable_auxiliary_classifiers']
+        )
+    )
+    parser.add_argument(
+        '--min-auxiliary-score',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['min_auxiliary_score'],
+    )
+    parser.add_argument(
+        '--max-auxiliary-blob-diameter',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['max_auxiliary_blob_diameter'],
+    )
+    parser.add_argument(
+        '--min-auxiliary-blob-area',
+        type=int,
+        default=DEFAULT_DETECTOR_PARAMS['min_auxiliary_blob_area'],
+    )
+    parser.add_argument(
         '--merge-distance',
         type=float,
         default=DEFAULT_DETECTOR_PARAMS['merge_distance'],
@@ -427,12 +457,27 @@ def detect_barrels(
     args: argparse.Namespace,
 ) -> List[BarrelCandidate]:
     args = apply_detection_sensitivity(args)
-    hough_candidates = detect_hough_barrels(image, info, args)
-    if hough_candidates:
-        return hough_candidates
+    candidates = detect_hough_barrels(image, info, args)
+    use_auxiliary = (
+        bool(getattr(args, 'enable_auxiliary_classifiers', True))
+        and (
+            float(getattr(args, 'detection_sensitivity', 50.0)) >= 75.0
+            or int(getattr(args, 'count', 0)) > len(candidates)
+        )
+    )
+    if use_auxiliary:
+        candidates.extend(detect_auxiliary_barrels(image, info, args))
+        candidates = merge_close_candidates(candidates, args.merge_distance)
+        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        if args.count > 0:
+            candidates = candidates[:args.count]
+        if candidates:
+            return candidates
+    elif candidates:
+        return candidates
 
     visited = bytearray(image.width * image.height)
-    candidates: List[BarrelCandidate] = []
+    candidates = []
 
     for index, pixel in enumerate(image.pixels):
         if visited[index] or occupancy_probability(pixel, info) < info.occupied_thresh:
@@ -592,6 +637,263 @@ def detect_hough_barrels(
     if args.count > 0:
         candidates = candidates[:args.count]
     return candidates
+
+
+def detect_auxiliary_barrels(
+    image: ImageMap,
+    info: MapInfo,
+    args: argparse.Namespace,
+) -> List[BarrelCandidate]:
+    grayscale = np.array(image.pixels, dtype=np.uint8).reshape(
+        (image.height, image.width)
+    )
+    occupied_image = 255 - grayscale if not info.negate else grayscale
+    _, occupied_mask = cv2.threshold(occupied_image, 127, 255, cv2.THRESH_BINARY)
+    wall_subtracted = subtract_wall_like_components(occupied_mask)
+    candidates = []
+    candidates.extend(
+        detect_contour_blob_candidates(wall_subtracted, image, info, args)
+    )
+    candidates.extend(
+        detect_template_blob_candidates(wall_subtracted, image, info, args)
+    )
+    candidates = merge_close_candidates(candidates, args.merge_distance)
+    candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+    return candidates
+
+
+def subtract_wall_like_components(occupied_mask: np.ndarray) -> np.ndarray:
+    kept = np.zeros_like(occupied_mask)
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        occupied_mask,
+        8,
+    )
+    for label in range(1, component_count):
+        area = stats[label, cv2.CC_STAT_AREA]
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        height = stats[label, cv2.CC_STAT_HEIGHT]
+        longest_side = max(width, height)
+        aspect_ratio = longest_side / max(1, min(width, height))
+        wall_like = area > 450 or longest_side > 45 or aspect_ratio > 6.0
+        if not wall_like:
+            kept[labels == label] = 255
+
+    return kept
+
+
+def detect_contour_blob_candidates(
+    mask: np.ndarray,
+    image: ImageMap,
+    info: MapInfo,
+    args: argparse.Namespace,
+) -> List[BarrelCandidate]:
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask,
+        8,
+    )
+    candidates = []
+    max_diameter_cells = max(
+        4,
+        int(round(args.max_auxiliary_blob_diameter / info.resolution)),
+    )
+    min_area = int(args.min_auxiliary_blob_area)
+    for label in range(1, component_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < min_area:
+            continue
+        if width > max_diameter_cells or height > max_diameter_cells:
+            continue
+        if width < 4 or height < 4:
+            continue
+        minor_major_ratio = min(width, height) / max(width, height)
+        if minor_major_ratio < 0.45:
+            continue
+
+        component_points = [
+            (int(px), int(py))
+            for py, px in zip(*np.where(labels == label))
+        ]
+        center_x, center_y = centroids[label]
+        radius_cells = max(3, int(round(0.55 * max(width, height))))
+        candidate = auxiliary_blob_to_candidate(
+            float(center_x),
+            float(center_y),
+            radius_cells,
+            area,
+            component_points,
+            image,
+            info,
+            args,
+            source_bonus=0.04,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def detect_template_blob_candidates(
+    mask: np.ndarray,
+    image: ImageMap,
+    info: MapInfo,
+    args: argparse.Namespace,
+) -> List[BarrelCandidate]:
+    blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+    candidates = []
+    min_radius, max_radius = hough_radius_range(image, info, args)
+    max_radius = min(max_radius, max(4, int(0.45 / info.resolution)))
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.1,
+        minDist=max(6, int(round(args.merge_distance / info.resolution))),
+        param1=60,
+        param2=max(4.0, float(args.hough_param2) - 4.0),
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+    if circles is None:
+        return candidates
+
+    for image_x, image_y, radius_cells in np.round(circles[0, :]).astype(int):
+        x0 = max(0, image_x - radius_cells)
+        x1 = min(image.width, image_x + radius_cells + 1)
+        y0 = max(0, image_y - radius_cells)
+        y1 = min(image.height, image_y + radius_cells + 1)
+        local_points = []
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                if mask[y, x] and math.hypot(x - image_x, y - image_y) <= radius_cells:
+                    local_points.append((x, y))
+        if not local_points:
+            continue
+
+        candidate = auxiliary_blob_to_candidate(
+            float(image_x),
+            float(image_y),
+            int(radius_cells),
+            len(local_points),
+            local_points,
+            image,
+            info,
+            args,
+            source_bonus=0.00,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    return candidates
+
+
+def auxiliary_blob_to_candidate(
+    image_x: float,
+    image_y: float,
+    radius_cells: int,
+    occupied_cells: int,
+    component_points: List[Tuple[int, int]],
+    image: ImageMap,
+    info: MapInfo,
+    args: argparse.Namespace,
+    source_bonus: float,
+) -> Optional[BarrelCandidate]:
+    map_cell_y = image.height - 1 - image_y
+    diameter = 2.0 * radius_cells * info.resolution
+    if args.max_diameter > 0.0 and diameter > args.max_diameter:
+        return None
+    if args.min_diameter > 0.0 and diameter < args.min_diameter:
+        return None
+
+    roundness = component_roundness(component_points)
+    corner_fill = component_corner_fill_ratio(component_points)
+    support, center_occupied_ratio = hough_circle_template_ratios(
+        int(round(image_x)),
+        int(round(image_y)),
+        radius_cells,
+        image,
+        info,
+    )
+    free_ring, occupied_ring, unknown_ring = hough_free_ring_ratios(
+        int(round(image_x)),
+        int(round(image_y)),
+        radius_cells,
+        image,
+        info,
+    )
+    square_corner_ratio = hough_square_corner_ratio(
+        int(round(image_x)),
+        int(round(image_y)),
+        radius_cells,
+        image,
+        info,
+    )
+    context_occupied, context_angle, context_longest_run = (
+        hough_context_occupied_metrics(
+            int(round(image_x)),
+            int(round(image_y)),
+            radius_cells,
+            image,
+            info,
+        )
+    )
+    wall_touching = hough_allows_wall_touching(
+        args,
+        free_ring,
+        occupied_ring,
+        context_occupied,
+        context_angle,
+        context_longest_run,
+    )
+    if not wall_touching and context_occupied > max(args.max_context_occupied_ratio, 0.08):
+        return None
+    if unknown_ring > args.max_unknown_ring_ratio:
+        return None
+    if square_corner_ratio > max(args.max_square_corner_ratio, 0.50):
+        return None
+
+    fill_ratio = occupied_cells / max(1.0, math.pi * radius_cells * radius_cells)
+    blob_size_score = clamp(1.0 - abs(fill_ratio - 0.55), 0.0, 1.0)
+    score = (
+        0.26 * roundness
+        + 0.18 * support
+        + 0.16 * (1.0 - center_occupied_ratio)
+        + 0.14 * free_ring
+        + 0.12 * (1.0 - corner_fill)
+        + 0.08 * blob_size_score
+        + 0.06 * (1.0 - square_corner_ratio)
+        - 0.08 * context_occupied
+        - 0.04 * occupied_ring
+        + source_bonus
+    )
+    if score < args.min_auxiliary_score:
+        return None
+
+    center_x, center_y = cell_to_world(image_x + 0.5, map_cell_y + 0.5, info)
+    return BarrelCandidate(
+        center_x=center_x,
+        center_y=center_y,
+        diameter=diameter,
+        width_x=diameter,
+        width_y=diameter,
+        occupied_cells=occupied_cells,
+        roundness=roundness,
+        circularity=support,
+        corner_fill_ratio=corner_fill,
+        bounding_box_fill_ratio=fill_ratio,
+        fill_ratio=fill_ratio,
+        free_ring_ratio=free_ring,
+        occupied_ring_ratio=occupied_ring,
+        unknown_ring_ratio=unknown_ring,
+        circle_support_ratio=support,
+        center_occupied_ratio=center_occupied_ratio,
+        radial_cv=0.0,
+        straight_edge_ratio=0.0,
+        square_corner_ratio=square_corner_ratio,
+        score=score,
+    )
 
 
 def hough_radius_range(

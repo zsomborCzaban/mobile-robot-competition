@@ -11,6 +11,7 @@ from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -48,6 +49,8 @@ class GroundTruthBarrelDetector(Node):
         self.last_signature = None
         self.latest_grid = None
         self.force_detection = False
+        self.last_marker_array = None
+        self.last_pose_array = None
         self.add_on_set_parameters_callback(self.on_parameters_updated)
 
         self.map_sub = self.create_subscription(
@@ -56,28 +59,45 @@ class GroundTruthBarrelDetector(Node):
             self.map_callback,
             10,
         )
+        rviz_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.marker_pub = self.create_publisher(
             MarkerArray,
             '/barrel_ground_truth_markers',
-            10,
+            rviz_qos,
+        )
+        self.marker_alias_pub = self.create_publisher(
+            MarkerArray,
+            '/barrel_markers',
+            rviz_qos,
         )
         self.pose_array_pub = self.create_publisher(
             PoseArray,
             '/barrel_ground_truth_poses',
-            10,
+            rviz_qos,
+        )
+        self.pose_array_alias_pub = self.create_publisher(
+            PoseArray,
+            '/barrel_poses',
+            rviz_qos,
         )
         self.confirmed_pose_pub = self.create_publisher(
             PoseStamped,
             '/barrel_confirmed_pose',
-            10,
+            rviz_qos,
         )
         self.status_pub = self.create_publisher(String, 'mission_status', 10)
         self.create_timer(0.5, self.reprocess_latest_grid_if_needed)
+        self.create_timer(1.0, self.republish_barrel_topics)
 
         self.get_logger().info(
             'Ground-truth barrel detector listening on '
             f'{self.get_parameter("map_topic").value}; YAML: '
-            f'{self.barrel_yaml_path()}'
+            f'{self.barrel_yaml_path()}; RViz marker topics: '
+            '/barrel_markers, /barrel_ground_truth_markers'
         )
 
     def declare_detector_parameters(self) -> None:
@@ -136,7 +156,7 @@ class GroundTruthBarrelDetector(Node):
 
     def detector_args(self) -> Namespace:
         return Namespace(
-            count=0,
+            count=self.expected_barrel_count(),
             max_auto_barrels=0,
             detection_sensitivity=float(
                 self.get_parameter('detection_sensitivity').value
@@ -208,6 +228,18 @@ class GroundTruthBarrelDetector(Node):
             ),
             min_wall_touch_longest_run_ratio=float(
                 self.get_parameter('min_wall_touch_longest_run_ratio').value
+            ),
+            enable_auxiliary_classifiers=bool(
+                self.get_parameter('enable_auxiliary_classifiers').value
+            ),
+            min_auxiliary_score=float(
+                self.get_parameter('min_auxiliary_score').value
+            ),
+            max_auxiliary_blob_diameter=float(
+                self.get_parameter('max_auxiliary_blob_diameter').value
+            ),
+            min_auxiliary_blob_area=int(
+                self.get_parameter('min_auxiliary_blob_area').value
             ),
             merge_distance=float(self.get_parameter('merge_distance').value),
         )
@@ -292,13 +324,31 @@ class GroundTruthBarrelDetector(Node):
                 self.make_label_marker(index, candidate, pose, stamp)
             )
 
-        self.marker_pub.publish(marker_array)
-        self.pose_array_pub.publish(pose_array)
+        self.last_marker_array = marker_array
+        self.last_pose_array = pose_array
+        self.publish_cached_barrel_topics()
         if pose_array.poses:
             first_pose = PoseStamped()
             first_pose.header = pose_array.header
             first_pose.pose = pose_array.poses[0]
             self.confirmed_pose_pub.publish(first_pose)
+
+    def republish_barrel_topics(self) -> None:
+        if self.last_marker_array is None or self.last_pose_array is None:
+            return
+        stamp = self.get_clock().now().to_msg()
+        for marker in self.last_marker_array.markers:
+            marker.header.stamp = stamp
+        self.last_pose_array.header.stamp = stamp
+        self.publish_cached_barrel_topics()
+
+    def publish_cached_barrel_topics(self) -> None:
+        if self.last_marker_array is None or self.last_pose_array is None:
+            return
+        self.marker_pub.publish(self.last_marker_array)
+        self.marker_alias_pub.publish(self.last_marker_array)
+        self.pose_array_pub.publish(self.last_pose_array)
+        self.pose_array_alias_pub.publish(self.last_pose_array)
 
     def make_cylinder_marker(
         self,

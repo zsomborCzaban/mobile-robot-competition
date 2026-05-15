@@ -15,7 +15,9 @@ Main target output:
 
 ```text
 /barrel_ground_truth_markers
+/barrel_markers
 /barrel_ground_truth_poses
+/barrel_poses
 ~/turtlebot4_ws/barrel_target.yaml
 ```
 
@@ -236,15 +238,19 @@ Add barrel displays with `Add -> By topic`:
 
 ```text
 /barrel_ground_truth_markers    MarkerArray
+/barrel_markers                 MarkerArray
 /barrel_ground_truth_poses      PoseArray
+/barrel_poses                   PoseArray
 /barrel_confirmed_pose          PoseStamped
 /mission_status                 String
 ```
 
 Most useful displays:
 
-- `/barrel_ground_truth_markers`: red cylinders and labels for all map-detected barrels.
+- `/barrel_markers`: red cylinders and labels for all map-detected barrels.
+- `/barrel_ground_truth_markers`: same marker array with the original full name.
 - `/barrel_ground_truth_poses`: pose array for all map-detected barrels.
+- `/barrel_poses`: same pose array with a shorter name.
 - `/barrel_confirmed_pose`: first detected barrel pose for compatibility.
 - `/mission_status`: current mission text, such as `Going to barrel 1/3`.
 
@@ -384,3 +390,8 @@ The same coarse adjustment is available as `detection_sensitivity` in ROS and
 Barrels tangent to a wall are handled by `allow_wall_touching:=true`, which is
 enabled by default. This only relaxes the wall-side ring/context checks when
 the occupied pixels look like a narrow tangent contact.
+
+At high sensitivity, or when `Expected barrels` is greater than the number of
+Hough detections, the detector also runs auxiliary contour/template classifiers
+after subtracting wall-like components. These are intended for weak or partial
+barrel marks, but they are less conservative than the default Hough path.
