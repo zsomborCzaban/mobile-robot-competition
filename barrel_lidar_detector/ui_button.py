@@ -7,6 +7,8 @@ import tkinter as tk
 from typing import Dict, List
 
 import rclpy
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -21,6 +23,11 @@ class MissionUIButton(Node):
         self.cli_pause = self.create_client(Trigger, 'pause_navigation')
         self.cli_res = self.create_client(Trigger, 'resume_navigation')
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
+        self.cli_fallback = self.create_client(Trigger, 'fallback_recovery')
+        self.detector_param_cli = self.create_client(
+            SetParameters,
+            '/ground_truth_barrel_detector/set_parameters',
+        )
         
         self.processes: Dict[str, subprocess.Popen] = {}
         self.status_label = None
@@ -67,10 +74,16 @@ class MissionUIButton(Node):
             status_label,
         )
 
-    def start_detectors(self, status_label, barrel_count_text: str) -> None:
+    def start_detectors(
+        self,
+        status_label,
+        barrel_count_text: str,
+        sensitivity_value: int,
+    ) -> None:
         expected_count = self.parse_expected_barrel_count(barrel_count_text, status_label)
         if expected_count is None:
             return
+        sensitivity = self.clamp_sensitivity(sensitivity_value)
 
         self.start_process(
             'ground_truth_barrel_detector',
@@ -82,9 +95,69 @@ class MissionUIButton(Node):
                 '--ros-args',
                 '-p',
                 f'expected_barrel_count:={expected_count}',
+                '-p',
+                f'detection_sensitivity:={sensitivity}',
             ],
             status_label,
         )
+
+    def set_detection_sensitivity(self, status_label, sensitivity_value: int) -> None:
+        sensitivity = self.clamp_sensitivity(sensitivity_value)
+        if not self.detector_param_cli.wait_for_service(timeout_sec=0.05):
+            self.set_status(
+                status_label,
+                f'Detection sensitivity {sensitivity}; applies when detector starts.',
+                'gray',
+            )
+            return
+
+        request = SetParameters.Request()
+        parameter = Parameter()
+        parameter.name = 'detection_sensitivity'
+        parameter.value = ParameterValue(
+            type=ParameterType.PARAMETER_DOUBLE,
+            double_value=float(sensitivity),
+        )
+        request.parameters = [parameter]
+        future = self.detector_param_cli.call_async(request)
+        future.add_done_callback(
+            lambda done: self.sensitivity_response_callback(
+                done,
+                status_label,
+                sensitivity,
+            )
+        )
+
+    def sensitivity_response_callback(
+        self,
+        future,
+        status_label,
+        sensitivity: int,
+    ) -> None:
+        try:
+            response = future.result()
+            successful = bool(response.results and response.results[0].successful)
+        except Exception as exc:
+            self.set_status(status_label, f'Sensitivity update failed: {exc}', 'red')
+            return
+
+        if successful:
+            self.set_status(
+                status_label,
+                f'Detection sensitivity set to {sensitivity}.',
+                'blue',
+            )
+        else:
+            reason = response.results[0].reason if response.results else 'unknown'
+            self.set_status(status_label, f'Sensitivity rejected: {reason}', 'red')
+
+    @staticmethod
+    def clamp_sensitivity(value) -> int:
+        try:
+            sensitivity = int(float(value))
+        except (TypeError, ValueError):
+            return 50
+        return max(0, min(100, sensitivity))
 
     def parse_expected_barrel_count(self, barrel_count_text: str, status_label):
         value = barrel_count_text.strip()
@@ -329,7 +402,7 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    root.geometry('390x640')
+    root.geometry('390x720')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
@@ -363,13 +436,60 @@ def main(args=None) -> None:
         font=('Arial', 10),
     ).pack(side='right')
 
+    sensitivity_frame = tk.LabelFrame(
+        root,
+        text='Barrel detection sensitivity',
+        font=('Arial', 10, 'bold'),
+        padx=8,
+        pady=5,
+    )
+    sensitivity_frame.pack(fill='x', padx=10, pady=(0, 8))
+
+    sensitivity_var = tk.IntVar(value=50)
+    sensitivity_value_lbl = tk.Label(
+        sensitivity_frame,
+        text='50',
+        width=4,
+        font=('Arial', 10, 'bold'),
+    )
+    sensitivity_value_lbl.pack(side='right', padx=(6, 0))
+
+    pending_sensitivity_update = {'job': None}
+
+    def on_sensitivity_change(value) -> None:
+        sensitivity = MissionUIButton.clamp_sensitivity(value)
+        sensitivity_value_lbl.config(text=str(sensitivity))
+        pending_job = pending_sensitivity_update['job']
+        if pending_job is not None:
+            root.after_cancel(pending_job)
+        pending_sensitivity_update['job'] = root.after(
+            300,
+            lambda: node.set_detection_sensitivity(status_lbl, sensitivity),
+        )
+
+    tk.Scale(
+        sensitivity_frame,
+        from_=0,
+        to=100,
+        orient='horizontal',
+        variable=sensitivity_var,
+        command=on_sensitivity_change,
+        showvalue=False,
+        resolution=1,
+        length=285,
+    ).pack(side='left', fill='x', expand=True)
+
     # --- Setup & Detection Frame ---
     btn_controller = tk.Button(root, text='1. Start Mission Controller', font=('Arial', 11, 'bold'), bg='lightgray', fg='black',
                                command=lambda: node.start_mission_controller(status_lbl, expected_barrels_var.get()))
     btn_controller.pack(fill='x', padx=10, pady=2, ipady=8)
 
     btn_detection = tk.Button(root, text='2. Start Map Barrel Detection', font=('Arial', 11, 'bold'), bg='deepskyblue', fg='black',
-                              command=lambda: node.start_detectors(status_lbl, expected_barrels_var.get()))
+                              command=lambda: node.start_detectors(
+                                  status_lbl,
+                                  expected_barrels_var.get(),
+                                  sensitivity_var.get(),
+                              ))
     btn_detection.pack(fill='x', padx=10, pady=2, ipady=8)
 
     btn_stop_detection = tk.Button(root, text='Stop Detection', font=('Arial', 10), bg='gray', fg='white',
@@ -394,6 +514,9 @@ def main(args=None) -> None:
               
     tk.Button(control_frame, text="▶ RESUME", font=("Arial", 10, "bold"), bg="lightgreen", fg="black", width=12,
               command=lambda: node.trigger_action(node.cli_res, "Resuming", status_lbl)).pack(side='right', expand=True)
+
+    tk.Button(root, text="FALLBACK: TURN + BACK UP + REPLAN", font=("Arial", 10, "bold"), bg="purple", fg="white",
+              command=lambda: node.trigger_action(node.cli_fallback, "Starting fallback", status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
 
     tk.Button(root, text="⏹ STOP & RESET", font=("Arial", 11, "bold"), bg="red", fg="white",
               command=lambda: node.stop_all(status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)

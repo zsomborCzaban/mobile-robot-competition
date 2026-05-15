@@ -26,6 +26,10 @@ class BarrelMissionController(Node):
         self.declare_parameter('approach_offset', 0.15)
         self.declare_parameter('expected_barrel_count', 0)
         self.declare_parameter('pose_timeout_sec', 1.0)
+        self.declare_parameter('fallback_turn_radians', math.pi)
+        self.declare_parameter('fallback_backup_distance', 1.0)
+        self.declare_parameter('fallback_backup_speed', 0.15)
+        self.declare_parameter('fallback_time_allowance_sec', 20.0)
         self.declare_parameter(
             'barrel_yaml_path',
             '~/turtlebot4_ws/barrel_target.yaml',
@@ -38,6 +42,8 @@ class BarrelMissionController(Node):
         self.waypoints: List[PoseStamped] = []
         self.current_waypoint_index = 0
         self.ordered_barrels: List[Dict] = []
+        self.recovery_phase = ''
+        self.recovery_visited_ids = set()
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -48,6 +54,7 @@ class BarrelMissionController(Node):
         self.create_service(Trigger, 'pause_navigation', self.pause_callback)
         self.create_service(Trigger, 'resume_navigation', self.resume_callback)
         self.create_service(Trigger, 'stop_navigation', self.stop_callback)
+        self.create_service(Trigger, 'fallback_recovery', self.fallback_callback)
         self.status_pub = self.create_publisher(String, 'mission_status', 10)
 
         self.timer = self.create_timer(0.5, self.control_loop)
@@ -76,30 +83,9 @@ class BarrelMissionController(Node):
             self.get_logger().warn(response.message)
             return response
 
-        robot_xy = self.robot_position()
-        if robot_xy is None:
-            response.success = False
-            response.message = (
-                'Robot pose unavailable; cannot calculate route. Check TF '
-                'map->odom->base_link or map->odom->base_footprint.'
-            )
-            self.get_logger().warn(response.message)
-            self.publish_status(response.message)
-            return response
-
-        self.ordered_barrels = self.astar_barrel_order(robot_xy, barrels)
-        self.waypoints = self.build_waypoints(robot_xy, self.ordered_barrels)
-
-        self.current_waypoint_index = 0
-        self.state = 'READY'
-        route = ', '.join(str(barrel['id']) for barrel in self.ordered_barrels)
-        first_barrel = str(self.ordered_barrels[0]['id'])
-        response.success = True
-        response.message = (
-            f'Calculated shortest route for {len(self.waypoints)} barrels '
-            f'from robot ({robot_xy[0]:.2f}, {robot_xy[1]:.2f}). '
-            f'First: {first_barrel}. Route: {route}'
-        )
+        success, message = self.calculate_route_from_barrels(barrels)
+        response.success = success
+        response.message = message
         self.get_logger().info(response.message)
         self.publish_status(response.message)
         return response
@@ -148,7 +134,44 @@ class BarrelMissionController(Node):
         self.waypoints = []
         self.ordered_barrels = []
         self.current_waypoint_index = 0
+        self.recovery_phase = ''
+        self.recovery_visited_ids = set()
         response.success, response.message = True, 'Mission stopped and reset.'
+        self.publish_status(response.message)
+        return response
+
+    def fallback_callback(self, request, response):
+        if self.state == 'RECOVERING':
+            response.success = False
+            response.message = 'Fallback recovery is already running.'
+            return response
+
+        if self.state not in ('NAVIGATING', 'PAUSED', 'READY'):
+            response.success = False
+            response.message = 'Fallback requires an active or ready mission.'
+            return response
+
+        self.recovery_visited_ids = {
+            str(barrel['id'])
+            for barrel in self.ordered_barrels[:self.current_waypoint_index]
+        }
+        self.navigator.cancelTask()
+        self.navigator.waitUntilNav2Active()
+        self.state = 'RECOVERING'
+        self.recovery_phase = 'TURNING'
+        turn_radians = float(self.get_parameter('fallback_turn_radians').value)
+        time_allowance = float(
+            self.get_parameter('fallback_time_allowance_sec').value
+        )
+        self.navigator.spin(
+            spin_dist=turn_radians,
+            time_allowance=time_allowance,
+        )
+
+        response.success = True
+        response.message = (
+            'Fallback started: turning around, backing up, then recalculating route.'
+        )
         self.publish_status(response.message)
         return response
 
@@ -173,6 +196,10 @@ class BarrelMissionController(Node):
         return message
 
     def control_loop(self):
+        if self.state == 'RECOVERING':
+            self.recovery_loop()
+            return
+
         if self.state != 'NAVIGATING':
             return
 
@@ -207,10 +234,99 @@ class BarrelMissionController(Node):
                     self.publish_status('Mission ended after final failed waypoint.')
                     self.state = 'IDLE'
 
+    def recovery_loop(self) -> None:
+        if not self.navigator.isTaskComplete():
+            return
+
+        result = self.navigator.getResult()
+        if result != TaskResult.SUCCEEDED:
+            message = f'Fallback {self.recovery_phase.lower()} failed.'
+            self.get_logger().warn(message)
+            self.publish_status(message)
+            self.state = 'PAUSED' if self.waypoints else 'IDLE'
+            self.recovery_phase = ''
+            return
+
+        if self.recovery_phase == 'TURNING':
+            self.recovery_phase = 'BACKING_UP'
+            backup_distance = float(
+                self.get_parameter('fallback_backup_distance').value
+            )
+            backup_speed = float(self.get_parameter('fallback_backup_speed').value)
+            time_allowance = float(
+                self.get_parameter('fallback_time_allowance_sec').value
+            )
+            self.navigator.backup(
+                backup_dist=backup_distance,
+                backup_speed=backup_speed,
+                time_allowance=time_allowance,
+            )
+            self.publish_status(f'Fallback: backing up {backup_distance:.1f} m.')
+            return
+
+        if self.recovery_phase == 'BACKING_UP':
+            self.recovery_phase = ''
+            success, message = self.recalculate_remaining_route()
+            self.publish_status(message)
+            if not success:
+                self.state = 'IDLE'
+                return
+
+            self.state = 'NAVIGATING'
+            self.send_current_waypoint()
+
     def publish_status(self, message: str) -> None:
         status = String()
         status.data = message
         self.status_pub.publish(status)
+
+    def calculate_route_from_barrels(self, barrels: List[Dict]) -> Tuple[bool, str]:
+        robot_xy = self.robot_position()
+        if robot_xy is None:
+            message = (
+                'Robot pose unavailable; cannot calculate route. Check TF '
+                'map->odom->base_link or map->odom->base_footprint.'
+            )
+            self.get_logger().warn(message)
+            return False, message
+
+        self.ordered_barrels = self.astar_barrel_order(robot_xy, barrels)
+        self.waypoints = self.build_waypoints(robot_xy, self.ordered_barrels)
+        self.current_waypoint_index = 0
+        self.state = 'READY'
+
+        route = ', '.join(str(barrel['id']) for barrel in self.ordered_barrels)
+        first_barrel = str(self.ordered_barrels[0]['id'])
+        message = (
+            f'Calculated shortest route for {len(self.waypoints)} barrels '
+            f'from robot ({robot_xy[0]:.2f}, {robot_xy[1]:.2f}). '
+            f'First: {first_barrel}. Route: {route}'
+        )
+        return True, message
+
+    def recalculate_remaining_route(self) -> Tuple[bool, str]:
+        yaml_path = self.barrel_yaml_path()
+        try:
+            barrels = self.load_barrels(yaml_path)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            message = f'Fallback route recalculation failed: {exc}'
+            self.get_logger().warn(message)
+            return False, message
+
+        remaining_barrels = [
+            barrel
+            for barrel in barrels
+            if str(barrel['id']) not in self.recovery_visited_ids
+        ]
+        if not remaining_barrels:
+            message = 'Fallback found no remaining barrels to navigate to.'
+            self.get_logger().warn(message)
+            return False, message
+
+        success, message = self.calculate_route_from_barrels(remaining_barrels)
+        if success:
+            message = f'Fallback complete. {message}'
+        return success, message
 
     def barrel_yaml_path(self) -> str:
         return os.path.expanduser(

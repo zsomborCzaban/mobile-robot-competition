@@ -175,8 +175,15 @@ Older quick button order:
 6. `Calculate Target Path`
 7. `START NAVIGATION`
 
-The UI also exposes pause, resume, and stop/reset controls for the active
-multi-barrel mission.
+The UI also exposes pause, resume, fallback, and stop/reset controls for the
+active multi-barrel mission. `FALLBACK: TURN + BACK UP + REPLAN` cancels the
+current Nav2 goal, turns the robot around, backs up `1.0 m`, recalculates the
+remaining barrel route from the new robot pose, and starts navigation again.
+
+The `Barrel detection sensitivity` slider controls the running
+`ground_truth_barrel_detector`. `50` is the default setting that matches the
+blue-marked example maps. Higher values accept weaker/partial circles; lower
+values make the detector more conservative.
 
 The UI starts detector/controller processes on the computer. That is expected:
 the Raspberry Pi runs the robot stack, while the computer runs this package.
@@ -195,6 +202,7 @@ ros2 service call /calculate_target std_srvs/srv/Trigger
 ros2 service call /start_navigation std_srvs/srv/Trigger
 ros2 service call /pause_navigation std_srvs/srv/Trigger
 ros2 service call /resume_navigation std_srvs/srv/Trigger
+ros2 service call /fallback_recovery std_srvs/srv/Trigger
 ros2 service call /stop_navigation std_srvs/srv/Trigger
 ```
 
@@ -338,15 +346,22 @@ The detector does not require a fixed barrel size. By default
 derived from the map image size. Override those only if the map contains many
 non-barrel circles.
 
+The offline saved-map script and the online `/map` detector use the same
+automatic detection defaults from `offline_barrel_marker.py`. Tune a parameter
+in one path with the same value in the other path when comparing results.
+
 Useful detector parameters:
 
 ```bash
 ros2 run barrel_lidar_detector ground_truth_barrel_detector --ros-args \
+  -p detection_sensitivity:=50 \
+  -p occupied_threshold:=50 \
+  -p min_radius_pixels:=3 \
+  -p hough_param2:=10.0 \
   -p min_score:=0.55 \
   -p min_free_ring_ratio:=0.65 \
   -p min_circle_support_ratio:=0.75 \
-  -p max_square_corner_ratio:=0.36 \
-  -p max_context_occupied_ratio:=0.04
+  -p max_unknown_ring_ratio:=0.35
 ```
 
 The mission controller default `approach_offset` is `0.15`. With the generated
@@ -355,7 +370,17 @@ For older YAML entries without surface fields, it falls back to `width / 2 +
 approach_offset` from the barrel center. If Nav2 still refuses to get that
 close, reduce the Nav2 costmap inflation radius in your Nav2 config.
 
+Fallback behavior can be tuned with `fallback_turn_radians`,
+`fallback_backup_distance`, `fallback_backup_speed`, and
+`fallback_time_allowance_sec` on `mission_controller`.
+
 If red markers appear on non-barrels, increase `min_score`, lower
 `max_square_corner_ratio`, or lower `max_context_occupied_ratio`. If real
-barrels are missed, lower `min_circle_support_ratio` or
-`min_free_ring_ratio`.
+barrels are missed on a live SLAM map, lower `min_radius_pixels`,
+`hough_param2`, `min_circle_support_ratio`, or `min_free_ring_ratio`.
+The same coarse adjustment is available as `detection_sensitivity` in ROS and
+`--sensitivity` in the offline marker script.
+
+Barrels tangent to a wall are handled by `allow_wall_touching:=true`, which is
+enabled by default. This only relaxes the wall-side ring/context checks when
+the occupied pixels look like a narrow tangent contact.

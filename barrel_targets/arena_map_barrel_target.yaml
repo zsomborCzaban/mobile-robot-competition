@@ -6,7 +6,7 @@ barrels:
   roundness: 0.947
   score: 0.97
   confirmations: 1
-  last_seen_unix_sec: 1778837438.931
+  last_seen_unix_sec: 1778852798.403
 - id: Barrel_002
   map_x: 0.425
   map_y: -4.775
@@ -14,4 +14,4 @@ barrels:
   roundness: 0.822
   score: 0.924
   confirmations: 1
-  last_seen_unix_sec: 1778837438.931
+  last_seen_unix_sec: 1778852798.403

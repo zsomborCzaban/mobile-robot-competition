@@ -11,6 +11,43 @@ import numpy as np
 import yaml
 
 
+DEFAULT_OCCUPIED_THRESHOLD = 50
+DEFAULT_FREE_THRESHOLD = 25
+DEFAULT_DETECTION_SENSITIVITY = 50.0
+
+
+DEFAULT_DETECTOR_PARAMS = {
+    'min_score': 0.55,
+    'min_diameter': 0.0,
+    'max_diameter': 0.0,
+    'min_radius_pixels': 3,
+    'hough_param2': 10.0,
+    'merge_distance': 0.45,
+    'min_roundness': 0.55,
+    'min_minor_major_ratio': 0.50,
+    'min_circularity': 0.15,
+    'max_corner_fill_ratio': 0.90,
+    'max_bounding_box_fill_ratio': 0.90,
+    'min_free_ring_ratio': 0.65,
+    'max_occupied_ring_ratio': 0.20,
+    'max_unknown_ring_ratio': 0.35,
+    'min_circle_support_ratio': 0.75,
+    'max_center_occupied_ratio': 0.85,
+    'max_radial_cv': 0.32,
+    'max_straight_edge_ratio': 0.80,
+    'max_square_corner_ratio': 0.36,
+    'min_hough_component_roundness': 0.75,
+    'max_hough_component_corner_fill': 0.70,
+    'min_border_clearance': 0.35,
+    'max_context_occupied_ratio': 0.04,
+    'allow_wall_touching': True,
+    'max_wall_touch_context_occupied_ratio': 0.30,
+    'max_wall_touch_occupied_ring_ratio': 0.45,
+    'max_wall_touch_angle_ratio': 0.45,
+    'min_wall_touch_longest_run_ratio': 0.60,
+}
+
+
 @dataclass
 class MapInfo:
     image_path: str
@@ -109,102 +146,182 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--min-diameter',
         type=float,
-        default=0.0,
+        default=DEFAULT_DETECTOR_PARAMS['min_diameter'],
         help='Minimum barrel diameter in meters. 0 lets the map image choose.',
     )
     parser.add_argument(
         '--max-diameter',
         type=float,
-        default=0.0,
+        default=DEFAULT_DETECTOR_PARAMS['max_diameter'],
         help='Maximum barrel diameter in meters. 0 lets the map image choose.',
     )
-    parser.add_argument('--min-roundness', type=float, default=0.55)
-    parser.add_argument('--min-minor-major-ratio', type=float, default=0.50)
-    parser.add_argument('--min-circularity', type=float, default=0.15)
-    parser.add_argument('--max-corner-fill-ratio', type=float, default=0.90)
-    parser.add_argument('--max-bounding-box-fill-ratio', type=float, default=0.90)
+    parser.add_argument(
+        '--occupied-threshold',
+        type=int,
+        default=DEFAULT_OCCUPIED_THRESHOLD,
+        help='Occupancy probability threshold, 0-100. Default: 50.',
+    )
+    parser.add_argument(
+        '--free-threshold',
+        type=int,
+        default=DEFAULT_FREE_THRESHOLD,
+        help='Free probability threshold, 0-100. Default: 25.',
+    )
+    parser.add_argument(
+        '--sensitivity',
+        dest='detection_sensitivity',
+        type=float,
+        default=DEFAULT_DETECTION_SENSITIVITY,
+        help='Detection sensitivity from 0 to 100. Default: 50.',
+    )
+    parser.add_argument(
+        '--min-radius-pixels',
+        type=int,
+        default=DEFAULT_DETECTOR_PARAMS['min_radius_pixels'],
+        help='Smallest Hough circle radius in map pixels. Default: 3.',
+    )
+    parser.add_argument(
+        '--hough-param2',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['hough_param2'],
+        help='Hough accumulator threshold. Lower values find weaker circles.',
+    )
+    parser.add_argument(
+        '--min-roundness',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['min_roundness'],
+    )
+    parser.add_argument(
+        '--min-minor-major-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['min_minor_major_ratio'],
+    )
+    parser.add_argument(
+        '--min-circularity',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['min_circularity'],
+    )
+    parser.add_argument(
+        '--max-corner-fill-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['max_corner_fill_ratio'],
+    )
+    parser.add_argument(
+        '--max-bounding-box-fill-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['max_bounding_box_fill_ratio'],
+    )
     parser.add_argument(
         '--min-score',
         type=float,
-        default=0.55,
+        default=DEFAULT_DETECTOR_PARAMS['min_score'],
         help='Minimum automatic barrel confidence score. Default: 0.55',
     )
     parser.add_argument(
         '--min-free-ring-ratio',
         type=float,
-        default=0.65,
+        default=DEFAULT_DETECTOR_PARAMS['min_free_ring_ratio'],
         help='Minimum free-space ratio around an automatic barrel. Default: 0.65',
     )
     parser.add_argument(
         '--max-occupied-ring-ratio',
         type=float,
-        default=0.20,
+        default=DEFAULT_DETECTOR_PARAMS['max_occupied_ring_ratio'],
         help='Maximum occupied-space ratio around an automatic barrel. Default: 0.20',
     )
     parser.add_argument(
         '--max-unknown-ring-ratio',
         type=float,
-        default=0.35,
+        default=DEFAULT_DETECTOR_PARAMS['max_unknown_ring_ratio'],
         help='Maximum unknown-space ratio around an automatic barrel. Default: 0.35',
     )
     parser.add_argument(
         '--min-circle-support-ratio',
         type=float,
-        default=0.75,
+        default=DEFAULT_DETECTOR_PARAMS['min_circle_support_ratio'],
         help='Minimum occupied support around the fitted barrel circle.',
     )
     parser.add_argument(
         '--max-center-occupied-ratio',
         type=float,
-        default=0.85,
+        default=DEFAULT_DETECTOR_PARAMS['max_center_occupied_ratio'],
         help='Reject filled/square blobs with too much occupied center area.',
     )
     parser.add_argument(
         '--max-radial-cv',
         type=float,
-        default=0.32,
+        default=DEFAULT_DETECTOR_PARAMS['max_radial_cv'],
         help='Reject blobs whose occupied pixels do not fit a circle closely.',
     )
     parser.add_argument(
         '--max-straight-edge-ratio',
         type=float,
-        default=0.80,
+        default=DEFAULT_DETECTOR_PARAMS['max_straight_edge_ratio'],
         help='Reject square-like outlines with dominant straight edges.',
     )
     parser.add_argument(
         '--max-square-corner-ratio',
         type=float,
-        default=0.36,
+        default=DEFAULT_DETECTOR_PARAMS['max_square_corner_ratio'],
         help='Reject Hough circles that are actually square/rectangular corners.',
     )
     parser.add_argument(
         '--min-hough-component-roundness',
         type=float,
-        default=0.75,
+        default=DEFAULT_DETECTOR_PARAMS['min_hough_component_roundness'],
         help='Minimum roundness of the occupied component under a Hough circle.',
     )
     parser.add_argument(
         '--max-hough-component-corner-fill',
         type=float,
-        default=0.70,
+        default=DEFAULT_DETECTOR_PARAMS['max_hough_component_corner_fill'],
         help='Reject Hough circles over square components with filled corners.',
     )
     parser.add_argument(
         '--min-border-clearance',
         type=float,
-        default=0.35,
+        default=DEFAULT_DETECTOR_PARAMS['min_border_clearance'],
         help='Reject circles too close to image edges or unexplored map borders.',
     )
     parser.add_argument(
         '--max-context-occupied-ratio',
         type=float,
-        default=0.04,
+        default=DEFAULT_DETECTOR_PARAMS['max_context_occupied_ratio'],
         help='Reject circles too close to larger occupied map structure.',
+    )
+    parser.add_argument(
+        '--no-wall-touching',
+        dest='allow_wall_touching',
+        action='store_false',
+        help='Disable special handling for barrels tangent to walls.',
+    )
+    parser.set_defaults(
+        allow_wall_touching=DEFAULT_DETECTOR_PARAMS['allow_wall_touching']
+    )
+    parser.add_argument(
+        '--max-wall-touch-context-occupied-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['max_wall_touch_context_occupied_ratio'],
+    )
+    parser.add_argument(
+        '--max-wall-touch-occupied-ring-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['max_wall_touch_occupied_ring_ratio'],
+    )
+    parser.add_argument(
+        '--max-wall-touch-angle-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['max_wall_touch_angle_ratio'],
+    )
+    parser.add_argument(
+        '--min-wall-touch-longest-run-ratio',
+        type=float,
+        default=DEFAULT_DETECTOR_PARAMS['min_wall_touch_longest_run_ratio'],
     )
     parser.add_argument(
         '--merge-distance',
         type=float,
-        default=0.45,
+        default=DEFAULT_DETECTOR_PARAMS['merge_distance'],
         help='Merge manual/detected barrels closer than this many meters.',
     )
     parser.add_argument(
@@ -309,6 +426,7 @@ def detect_barrels(
     info: MapInfo,
     args: argparse.Namespace,
 ) -> List[BarrelCandidate]:
+    args = apply_detection_sensitivity(args)
     hough_candidates = detect_hough_barrels(image, info, args)
     if hough_candidates:
         return hough_candidates
@@ -331,6 +449,101 @@ def detect_barrels(
     return candidates
 
 
+def apply_detection_sensitivity(args: argparse.Namespace) -> argparse.Namespace:
+    sensitivity = clamp(
+        float(getattr(args, 'detection_sensitivity', DEFAULT_DETECTION_SENSITIVITY)),
+        0.0,
+        100.0,
+    )
+    adjusted = argparse.Namespace(**vars(args))
+    if sensitivity > DEFAULT_DETECTION_SENSITIVITY:
+        factor = (sensitivity - DEFAULT_DETECTION_SENSITIVITY) / 50.0
+        adjusted.min_score = clamp(args.min_score - 0.10 * factor, 0.25, 0.95)
+        adjusted.min_free_ring_ratio = clamp(
+            args.min_free_ring_ratio - 0.20 * factor,
+            0.20,
+            0.95,
+        )
+        adjusted.max_occupied_ring_ratio = clamp(
+            args.max_occupied_ring_ratio + 0.15 * factor,
+            0.05,
+            0.60,
+        )
+        adjusted.max_unknown_ring_ratio = clamp(
+            args.max_unknown_ring_ratio + 0.35 * factor,
+            0.05,
+            0.95,
+        )
+        adjusted.min_circle_support_ratio = clamp(
+            args.min_circle_support_ratio - 0.20 * factor,
+            0.35,
+            0.95,
+        )
+        adjusted.min_hough_component_roundness = clamp(
+            args.min_hough_component_roundness - 0.30 * factor,
+            0.25,
+            0.95,
+        )
+        adjusted.max_hough_component_corner_fill = clamp(
+            args.max_hough_component_corner_fill + 0.10 * factor,
+            0.40,
+            0.95,
+        )
+        adjusted.min_border_clearance = clamp(
+            args.min_border_clearance - 0.25 * factor,
+            0.00,
+            1.00,
+        )
+        adjusted.max_context_occupied_ratio = clamp(
+            args.max_context_occupied_ratio + 0.06 * factor,
+            0.00,
+            0.20,
+        )
+        adjusted.hough_param2 = clamp(args.hough_param2 - 4.0 * factor, 4.0, 20.0)
+        adjusted.min_radius_pixels = max(1, round(args.min_radius_pixels - factor))
+    elif sensitivity < DEFAULT_DETECTION_SENSITIVITY:
+        factor = (DEFAULT_DETECTION_SENSITIVITY - sensitivity) / 50.0
+        adjusted.min_score = clamp(args.min_score + 0.15 * factor, 0.25, 0.95)
+        adjusted.min_free_ring_ratio = clamp(
+            args.min_free_ring_ratio + 0.15 * factor,
+            0.20,
+            0.95,
+        )
+        adjusted.max_occupied_ring_ratio = clamp(
+            args.max_occupied_ring_ratio - 0.08 * factor,
+            0.05,
+            0.60,
+        )
+        adjusted.max_unknown_ring_ratio = clamp(
+            args.max_unknown_ring_ratio - 0.15 * factor,
+            0.05,
+            0.95,
+        )
+        adjusted.min_circle_support_ratio = clamp(
+            args.min_circle_support_ratio + 0.10 * factor,
+            0.35,
+            0.95,
+        )
+        adjusted.min_hough_component_roundness = clamp(
+            args.min_hough_component_roundness + 0.15 * factor,
+            0.25,
+            0.95,
+        )
+        adjusted.max_context_occupied_ratio = clamp(
+            args.max_context_occupied_ratio - 0.02 * factor,
+            0.00,
+            0.20,
+        )
+        adjusted.hough_param2 = clamp(args.hough_param2 + 3.0 * factor, 4.0, 20.0)
+        adjusted.min_radius_pixels = max(1, round(args.min_radius_pixels + factor))
+
+    return adjusted
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
 def detect_hough_barrels(
     image: ImageMap,
     info: MapInfo,
@@ -342,33 +555,37 @@ def detect_hough_barrels(
     occupied_image = 255 - grayscale if not info.negate else grayscale
     min_radius, max_radius = hough_radius_range(image, info, args)
     proposal_images = hough_proposal_images(occupied_image)
+    hough_param2_values = [float(getattr(args, 'hough_param2', 10.0))]
+    if min_radius <= 2:
+        hough_param2_values.append(max(4.0, hough_param2_values[0] - 2.0))
 
     candidates = []
     for proposal_image in proposal_images:
-        circles = cv2.HoughCircles(
-            proposal_image,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=max(8, int(round(args.merge_distance / info.resolution))),
-            param1=80,
-            param2=10,
-            minRadius=min_radius,
-            maxRadius=max_radius,
-        )
-        if circles is None:
-            continue
-
-        for image_x, image_y, radius in np.round(circles[0, :]).astype(int):
-            candidate = hough_circle_to_candidate(
-                int(image_x),
-                int(image_y),
-                int(radius),
-                image,
-                info,
-                args,
+        for hough_param2 in hough_param2_values:
+            circles = cv2.HoughCircles(
+                proposal_image,
+                cv2.HOUGH_GRADIENT,
+                dp=1.2,
+                minDist=max(8, int(round(args.merge_distance / info.resolution))),
+                param1=80,
+                param2=hough_param2,
+                minRadius=min_radius,
+                maxRadius=max_radius,
             )
-            if candidate is not None:
-                candidates.append(candidate)
+            if circles is None:
+                continue
+
+            for image_x, image_y, radius in np.round(circles[0, :]).astype(int):
+                candidate = hough_circle_to_candidate(
+                    int(image_x),
+                    int(image_y),
+                    int(radius),
+                    image,
+                    info,
+                    args,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
 
     candidates = merge_close_candidates(candidates, args.merge_distance)
     candidates.sort(key=lambda candidate: candidate.score, reverse=True)
@@ -385,14 +602,14 @@ def hough_radius_range(
     if args.min_diameter > 0.0:
         min_radius = int(math.floor(args.min_diameter * 0.5 / info.resolution))
     else:
-        min_radius = 3
+        min_radius = int(getattr(args, 'min_radius_pixels', 3))
 
     if args.max_diameter > 0.0:
         max_radius = int(math.ceil(args.max_diameter * 0.5 / info.resolution))
     else:
         max_radius = max(8, min(image.width, image.height) // 12)
 
-    min_radius = max(2, min_radius)
+    min_radius = max(1, min_radius)
     max_radius = max(min_radius + 1, max_radius)
     return min_radius, max_radius
 
@@ -455,6 +672,16 @@ def hough_circle_to_candidate(
     if center_occupied_ratio > args.max_center_occupied_ratio:
         return None
 
+    component_metrics = hough_component_metrics(
+        image_x,
+        image_y,
+        radius_cells,
+        image,
+        info,
+        local_limit=False,
+    )
+    component_ok = hough_component_passes(component_metrics, args)
+
     free_ring_ratio, occupied_ring_ratio, unknown_ring_ratio = hough_free_ring_ratios(
         image_x,
         image_y,
@@ -462,10 +689,6 @@ def hough_circle_to_candidate(
         image,
         info,
     )
-    if free_ring_ratio < args.min_free_ring_ratio:
-        return None
-    if occupied_ring_ratio > args.max_occupied_ring_ratio:
-        return None
     if unknown_ring_ratio > args.max_unknown_ring_ratio:
         return None
 
@@ -479,29 +702,46 @@ def hough_circle_to_candidate(
     if square_corner_ratio > args.max_square_corner_ratio:
         return None
 
-    context_occupied_ratio = hough_context_occupied_ratio(
+    context_metrics = hough_context_occupied_metrics(
         image_x,
         image_y,
         radius_cells,
         image,
         info,
     )
-    if context_occupied_ratio > args.max_context_occupied_ratio:
+    (
+        context_occupied_ratio,
+        context_angle_ratio,
+        context_longest_run_ratio,
+    ) = context_metrics
+    wall_touching = hough_allows_wall_touching(
+        args,
+        free_ring_ratio,
+        occupied_ring_ratio,
+        context_occupied_ratio,
+        context_angle_ratio,
+        context_longest_run_ratio,
+    )
+    if wall_touching and not component_ok:
+        component_metrics = hough_component_metrics(
+            image_x,
+            image_y,
+            radius_cells,
+            image,
+            info,
+            local_limit=True,
+        )
+        component_ok = hough_component_passes(component_metrics, args)
+
+    if not component_ok or component_metrics is None:
         return None
 
-    component_metrics = hough_component_metrics(
-        image_x,
-        image_y,
-        radius_cells,
-        image,
-        info,
-    )
-    if component_metrics is None:
-        return None
     component_cells, component_roundness, component_corner_fill = component_metrics
-    if component_roundness < args.min_hough_component_roundness:
+    if not wall_touching and free_ring_ratio < args.min_free_ring_ratio:
         return None
-    if component_corner_fill > args.max_hough_component_corner_fill:
+    if not wall_touching and occupied_ring_ratio > args.max_occupied_ring_ratio:
+        return None
+    if not wall_touching and context_occupied_ratio > args.max_context_occupied_ratio:
         return None
 
     side_ratio = hough_square_side_ratio(image_x, image_y, radius_cells, image, info)
@@ -601,6 +841,7 @@ def hough_component_metrics(
     radius_cells: int,
     image: ImageMap,
     info: MapInfo,
+    local_limit: bool = False,
 ) -> Optional[Tuple[int, float, float]]:
     start = nearest_occupied_cell_on_circle(image_x, image_y, radius_cells, image, info)
     if start is None:
@@ -609,6 +850,7 @@ def hough_component_metrics(
     queue = deque([start])
     visited = {start}
     component: List[Tuple[int, int]] = []
+    local_radius = radius_cells + max(2.0, 0.15 / info.resolution)
 
     while queue:
         x, y = queue.popleft()
@@ -623,6 +865,11 @@ def hough_component_metrics(
                 next_cell = (next_x, next_y)
                 if next_cell in visited:
                     continue
+                if (
+                    local_limit
+                    and math.hypot(next_x - image_x, next_y - image_y) > local_radius
+                ):
+                    continue
                 if not image_cell_is_occupied(next_x, next_y, image, info):
                     continue
 
@@ -634,6 +881,20 @@ def hough_component_metrics(
         component_roundness(component),
         component_corner_fill_ratio(component),
     )
+
+
+def hough_component_passes(
+    component_metrics: Optional[Tuple[int, float, float]],
+    args: argparse.Namespace,
+) -> bool:
+    if component_metrics is None:
+        return False
+    _, component_roundness, component_corner_fill = component_metrics
+    if component_roundness < args.min_hough_component_roundness:
+        return False
+    if component_corner_fill > args.max_hough_component_corner_fill:
+        return False
+    return True
 
 
 def nearest_occupied_cell_on_circle(
@@ -742,6 +1003,98 @@ def hough_context_occupied_ratio(
                 occupied_cells += 1
 
     return occupied_cells / total_cells if total_cells else 1.0
+
+
+def hough_context_occupied_metrics(
+    image_x: int,
+    image_y: int,
+    radius_cells: int,
+    image: ImageMap,
+    info: MapInfo,
+) -> Tuple[float, float, float]:
+    inner_radius = radius_cells + max(2.0, 0.35 / info.resolution)
+    outer_radius = radius_cells + max(inner_radius + 1.0, 1.0 / info.resolution)
+    outer_cells = int(math.ceil(outer_radius))
+    angle_bins = 36
+    occupied_bins = [False] * angle_bins
+    occupied_cells = 0
+    total_cells = 0
+
+    for y in range(image_y - outer_cells, image_y + outer_cells + 1):
+        for x in range(image_x - outer_cells, image_x + outer_cells + 1):
+            if x < 0 or x >= image.width or y < 0 or y >= image.height:
+                continue
+
+            dx = x - image_x
+            dy = y - image_y
+            distance = math.hypot(dx, dy)
+            if distance < inner_radius or distance > outer_radius:
+                continue
+
+            total_cells += 1
+            if image_cell_is_occupied(x, y, image, info):
+                occupied_cells += 1
+                angle = math.atan2(dy, dx)
+                bin_index = int(((angle + math.pi) / (2.0 * math.pi)) * angle_bins)
+                occupied_bins[min(angle_bins - 1, max(0, bin_index))] = True
+
+    if total_cells == 0:
+        return 1.0, 1.0, 1.0
+
+    occupied_bin_count = sum(1 for occupied in occupied_bins if occupied)
+    angle_ratio = occupied_bin_count / angle_bins
+    longest_run = longest_circular_true_run(occupied_bins)
+    longest_run_ratio = (
+        longest_run / occupied_bin_count
+        if occupied_bin_count
+        else 0.0
+    )
+    return occupied_cells / total_cells, angle_ratio, longest_run_ratio
+
+
+def longest_circular_true_run(values: Sequence[bool]) -> int:
+    if not values:
+        return 0
+    if all(values):
+        return len(values)
+
+    doubled = list(values) + list(values)
+    best = 0
+    current = 0
+    for value in doubled:
+        if value:
+            current += 1
+            best = max(best, min(current, len(values)))
+        else:
+            current = 0
+    return best
+
+
+def hough_allows_wall_touching(
+    args: argparse.Namespace,
+    free_ring_ratio: float,
+    occupied_ring_ratio: float,
+    context_occupied_ratio: float,
+    context_angle_ratio: float,
+    context_longest_run_ratio: float,
+) -> bool:
+    if not bool(getattr(args, 'allow_wall_touching', True)):
+        return False
+    ring_shows_contact = (
+        free_ring_ratio < args.min_free_ring_ratio
+        or occupied_ring_ratio > args.max_occupied_ring_ratio
+    )
+    if not ring_shows_contact:
+        return False
+    if occupied_ring_ratio > args.max_wall_touch_occupied_ring_ratio:
+        return False
+    if context_occupied_ratio > args.max_wall_touch_context_occupied_ratio:
+        return False
+    if context_angle_ratio > args.max_wall_touch_angle_ratio:
+        return False
+    if context_longest_run_ratio < args.min_wall_touch_longest_run_ratio:
+        return False
+    return context_occupied_ratio > args.max_context_occupied_ratio
 
 
 def hough_square_corner_ratio(
@@ -1409,6 +1762,8 @@ def process_map(
     args: argparse.Namespace,
 ) -> List[BarrelCandidate]:
     info = load_map_info(map_yaml)
+    info.occupied_thresh = int(args.occupied_threshold) / 100.0
+    info.free_thresh = int(args.free_threshold) / 100.0
     image = None
     needs_image = not args.no_auto or bool(annotated_path)
     if needs_image:

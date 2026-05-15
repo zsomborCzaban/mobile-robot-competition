@@ -9,12 +9,17 @@ import yaml
 import rclpy
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from nav_msgs.msg import OccupancyGrid
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 from barrel_lidar_detector.offline_barrel_marker import (
     BarrelCandidate,
+    DEFAULT_DETECTION_SENSITIVITY,
+    DEFAULT_DETECTOR_PARAMS,
+    DEFAULT_FREE_THRESHOLD,
+    DEFAULT_OCCUPIED_THRESHOLD,
     ImageMap,
     MapInfo,
     detect_barrels,
@@ -30,24 +35,20 @@ class GroundTruthBarrelDetector(Node):
         self.declare_parameter('barrel_yaml_path', '~/turtlebot4_ws/barrel_target.yaml')
         self.declare_parameter('expected_barrel_count', 0)
         self.declare_parameter('detect_period_sec', 2.0)
-        self.declare_parameter('min_score', 0.55)
-        self.declare_parameter('min_diameter', 0.0)
-        self.declare_parameter('max_diameter', 0.0)
-        self.declare_parameter('merge_distance', 0.45)
-        self.declare_parameter('min_free_ring_ratio', 0.65)
-        self.declare_parameter('max_occupied_ring_ratio', 0.20)
-        self.declare_parameter('max_unknown_ring_ratio', 0.35)
-        self.declare_parameter('min_circle_support_ratio', 0.75)
-        self.declare_parameter('max_center_occupied_ratio', 0.85)
-        self.declare_parameter('max_square_corner_ratio', 0.36)
-        self.declare_parameter('min_hough_component_roundness', 0.75)
-        self.declare_parameter('max_hough_component_corner_fill', 0.70)
-        self.declare_parameter('min_border_clearance', 0.35)
-        self.declare_parameter('max_context_occupied_ratio', 0.04)
+        self.declare_parameter('occupied_threshold', DEFAULT_OCCUPIED_THRESHOLD)
+        self.declare_parameter('free_threshold', DEFAULT_FREE_THRESHOLD)
+        self.declare_parameter(
+            'detection_sensitivity',
+            DEFAULT_DETECTION_SENSITIVITY,
+        )
+        self.declare_detector_parameters()
 
         self.target_frame = str(self.get_parameter('target_frame').value)
         self.last_detection_sec = 0.0
         self.last_signature = None
+        self.latest_grid = None
+        self.force_detection = False
+        self.add_on_set_parameters_callback(self.on_parameters_updated)
 
         self.map_sub = self.create_subscription(
             OccupancyGrid,
@@ -71,6 +72,7 @@ class GroundTruthBarrelDetector(Node):
             10,
         )
         self.status_pub = self.create_publisher(String, 'mission_status', 10)
+        self.create_timer(0.5, self.reprocess_latest_grid_if_needed)
 
         self.get_logger().info(
             'Ground-truth barrel detector listening on '
@@ -78,14 +80,43 @@ class GroundTruthBarrelDetector(Node):
             f'{self.barrel_yaml_path()}'
         )
 
+    def declare_detector_parameters(self) -> None:
+        for name, default_value in DEFAULT_DETECTOR_PARAMS.items():
+            self.declare_parameter(name, default_value)
+
+    def on_parameters_updated(self, parameters) -> SetParametersResult:
+        detector_parameter_names = {
+            'detection_sensitivity',
+            'occupied_threshold',
+            'free_threshold',
+            *DEFAULT_DETECTOR_PARAMS.keys(),
+        }
+        if any(parameter.name in detector_parameter_names for parameter in parameters):
+            self.last_signature = None
+            self.last_detection_sec = 0.0
+            self.force_detection = True
+
+        return SetParametersResult(successful=True)
+
     def map_callback(self, grid: OccupancyGrid) -> None:
+        self.latest_grid = grid
+        self.process_grid(grid)
+
+    def reprocess_latest_grid_if_needed(self) -> None:
+        if not self.force_detection or self.latest_grid is None:
+            return
+
+        self.force_detection = False
+        self.process_grid(self.latest_grid, force=True)
+
+    def process_grid(self, grid: OccupancyGrid, force: bool = False) -> None:
         now_sec = time.monotonic()
         detect_period = max(float(self.get_parameter('detect_period_sec').value), 0.1)
-        if now_sec - self.last_detection_sec < detect_period:
+        if not force and now_sec - self.last_detection_sec < detect_period:
             return
 
         signature = self.map_signature(grid)
-        if signature == self.last_signature:
+        if not force and signature == self.last_signature:
             return
 
         self.last_detection_sec = now_sec
@@ -107,13 +138,27 @@ class GroundTruthBarrelDetector(Node):
         return Namespace(
             count=0,
             max_auto_barrels=0,
+            detection_sensitivity=float(
+                self.get_parameter('detection_sensitivity').value
+            ),
             min_diameter=float(self.get_parameter('min_diameter').value),
             max_diameter=float(self.get_parameter('max_diameter').value),
-            min_roundness=0.55,
-            min_minor_major_ratio=0.50,
-            min_circularity=0.15,
-            max_corner_fill_ratio=0.90,
-            max_bounding_box_fill_ratio=0.90,
+            min_radius_pixels=max(
+                1,
+                int(self.get_parameter('min_radius_pixels').value),
+            ),
+            hough_param2=float(self.get_parameter('hough_param2').value),
+            min_roundness=float(self.get_parameter('min_roundness').value),
+            min_minor_major_ratio=float(
+                self.get_parameter('min_minor_major_ratio').value
+            ),
+            min_circularity=float(self.get_parameter('min_circularity').value),
+            max_corner_fill_ratio=float(
+                self.get_parameter('max_corner_fill_ratio').value
+            ),
+            max_bounding_box_fill_ratio=float(
+                self.get_parameter('max_bounding_box_fill_ratio').value
+            ),
             min_score=float(self.get_parameter('min_score').value),
             min_free_ring_ratio=float(
                 self.get_parameter('min_free_ring_ratio').value
@@ -130,8 +175,10 @@ class GroundTruthBarrelDetector(Node):
             max_center_occupied_ratio=float(
                 self.get_parameter('max_center_occupied_ratio').value
             ),
-            max_radial_cv=0.32,
-            max_straight_edge_ratio=0.80,
+            max_radial_cv=float(self.get_parameter('max_radial_cv').value),
+            max_straight_edge_ratio=float(
+                self.get_parameter('max_straight_edge_ratio').value
+            ),
             max_square_corner_ratio=float(
                 self.get_parameter('max_square_corner_ratio').value
             ),
@@ -147,12 +194,29 @@ class GroundTruthBarrelDetector(Node):
             max_context_occupied_ratio=float(
                 self.get_parameter('max_context_occupied_ratio').value
             ),
+            allow_wall_touching=bool(
+                self.get_parameter('allow_wall_touching').value
+            ),
+            max_wall_touch_context_occupied_ratio=float(
+                self.get_parameter('max_wall_touch_context_occupied_ratio').value
+            ),
+            max_wall_touch_occupied_ring_ratio=float(
+                self.get_parameter('max_wall_touch_occupied_ring_ratio').value
+            ),
+            max_wall_touch_angle_ratio=float(
+                self.get_parameter('max_wall_touch_angle_ratio').value
+            ),
+            min_wall_touch_longest_run_ratio=float(
+                self.get_parameter('min_wall_touch_longest_run_ratio').value
+            ),
             merge_distance=float(self.get_parameter('merge_distance').value),
         )
 
     def grid_to_image_map(self, grid: OccupancyGrid) -> Tuple[ImageMap, MapInfo]:
         width = int(grid.info.width)
         height = int(grid.info.height)
+        occupied_threshold = int(self.get_parameter('occupied_threshold').value)
+        free_threshold = int(self.get_parameter('free_threshold').value)
         pixels: List[int] = []
         for image_y in range(height):
             map_y = height - 1 - image_y
@@ -160,9 +224,9 @@ class GroundTruthBarrelDetector(Node):
                 value = grid.data[map_y * width + x]
                 if value < 0:
                     pixels.append(205)
-                elif value >= 65:
+                elif value >= occupied_threshold:
                     pixels.append(0)
-                elif value <= 25:
+                elif value <= free_threshold:
                     pixels.append(254)
                 else:
                     pixels.append(205)
@@ -175,8 +239,8 @@ class GroundTruthBarrelDetector(Node):
             origin_y=float(origin.position.y),
             origin_yaw=self.quaternion_to_yaw(origin.orientation),
             negate=0,
-            occupied_thresh=0.65,
-            free_thresh=0.25,
+            occupied_thresh=occupied_threshold / 100.0,
+            free_thresh=free_threshold / 100.0,
         )
         return ImageMap(width=width, height=height, pixels=pixels), info
 
