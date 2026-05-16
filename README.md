@@ -123,6 +123,20 @@ Recommended full workflow:
    ros2 launch turtlebot4_navigation slam.launch.py
    ```
 
+   For a more detailed map, use the package SLAM config instead of editing the
+   system config directly:
+
+   ```bash
+   ros2 launch turtlebot4_navigation slam.launch.py \
+     params:=~/Desktop/studies/autonomous_mobile_robots/practical_work/code/install/barrel_lidar_detector/share/barrel_lidar_detector/config/slam_toolbox_mapping.yaml
+   ```
+
+   The config uses `0.03 m/cell`. Avoid `0.01 m/cell` for live mapping unless
+   you have confirmed the computer can keep up: compared with the normal
+   `0.05 m/cell`, it creates 25 times as many map cells and can make
+   `slam_toolbox`, RViz, and the barrel detector fall behind until `/map`
+   appears stuck.
+
 3. On the computer, start RViz:
 
    ```bash
