@@ -24,6 +24,10 @@ class MissionUIButton(Node):
         self.cli_res = self.create_client(Trigger, 'resume_navigation')
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
         self.cli_fallback = self.create_client(Trigger, 'fallback_recovery')
+        self.mission_param_cli = self.create_client(
+            SetParameters,
+            '/barrel_mission_controller/set_parameters',
+        )
         self.detector_param_cli = self.create_client(
             SetParameters,
             '/ground_truth_barrel_detector/set_parameters',
@@ -52,12 +56,13 @@ class MissionUIButton(Node):
         status_label.after(0, lambda: status_label.config(text=text, fg=color))
 
     def start_mission_controller(self, status_label, barrel_count_text: str) -> None:
-        if self.cli_calc.wait_for_service(timeout_sec=0.2):
-            self.set_status(status_label, 'Mission controller already running.', 'green')
-            return
-
         expected_count = self.parse_expected_barrel_count(barrel_count_text, status_label)
         if expected_count is None:
+            return
+
+        if self.cli_calc.wait_for_service(timeout_sec=0.2):
+            self.set_status(status_label, 'Mission controller already running.', 'green')
+            self.set_mission_expected_count(status_label, expected_count)
             return
 
         self.start_process(
@@ -74,6 +79,47 @@ class MissionUIButton(Node):
             status_label,
         )
 
+    def set_mission_expected_count(self, status_label, expected_count: int) -> None:
+        if not self.mission_param_cli.wait_for_service(timeout_sec=0.1):
+            return
+
+        request = SetParameters.Request()
+        parameter = Parameter()
+        parameter.name = 'expected_barrel_count'
+        parameter.value = ParameterValue(
+            type=ParameterType.PARAMETER_INTEGER,
+            integer_value=int(expected_count),
+        )
+        request.parameters = [parameter]
+        future = self.mission_param_cli.call_async(request)
+        future.add_done_callback(
+            lambda done: self.mission_expected_count_response_callback(
+                done,
+                status_label,
+                expected_count,
+            )
+        )
+
+    def mission_expected_count_response_callback(
+        self,
+        future,
+        status_label,
+        expected_count: int,
+    ) -> None:
+        try:
+            response = future.result()
+            successful = bool(response.results and response.results[0].successful)
+        except Exception as exc:
+            self.set_status(status_label, f'Mission target update failed: {exc}', 'red')
+            return
+
+        if successful:
+            label = str(expected_count) if expected_count > 0 else 'unlimited'
+            self.set_status(status_label, f'Mission expected barrels: {label}.', 'blue')
+        else:
+            reason = response.results[0].reason if response.results else 'unknown'
+            self.set_status(status_label, f'Mission target rejected: {reason}', 'red')
+
     def start_detectors(
         self,
         status_label,
@@ -84,6 +130,15 @@ class MissionUIButton(Node):
         if expected_count is None:
             return
         sensitivity = self.clamp_sensitivity(sensitivity_value)
+
+        if self.detector_param_cli.wait_for_service(timeout_sec=0.2):
+            self.set_status(
+                status_label,
+                'Map barrel detector already running.',
+                'green',
+            )
+            self.set_detector_parameters(status_label, expected_count, sensitivity)
+            return
 
         self.start_process(
             'ground_truth_barrel_detector',
@@ -100,6 +155,70 @@ class MissionUIButton(Node):
             ],
             status_label,
         )
+
+    def set_detector_parameters(
+        self,
+        status_label,
+        expected_count: int,
+        sensitivity: int,
+    ) -> None:
+        request = SetParameters.Request()
+
+        count_parameter = Parameter()
+        count_parameter.name = 'expected_barrel_count'
+        count_parameter.value = ParameterValue(
+            type=ParameterType.PARAMETER_INTEGER,
+            integer_value=int(expected_count),
+        )
+
+        sensitivity_parameter = Parameter()
+        sensitivity_parameter.name = 'detection_sensitivity'
+        sensitivity_parameter.value = ParameterValue(
+            type=ParameterType.PARAMETER_DOUBLE,
+            double_value=float(sensitivity),
+        )
+
+        request.parameters = [count_parameter, sensitivity_parameter]
+        future = self.detector_param_cli.call_async(request)
+        future.add_done_callback(
+            lambda done: self.detector_parameters_response_callback(
+                done,
+                status_label,
+                expected_count,
+                sensitivity,
+            )
+        )
+
+    def detector_parameters_response_callback(
+        self,
+        future,
+        status_label,
+        expected_count: int,
+        sensitivity: int,
+    ) -> None:
+        try:
+            response = future.result()
+            successful = all(result.successful for result in response.results)
+        except Exception as exc:
+            self.set_status(
+                status_label,
+                f'Detector parameter update failed: {exc}',
+                'red',
+            )
+            return
+
+        if successful:
+            self.set_status(
+                status_label,
+                (
+                    'Detector running. '
+                    f'Expected barrels: {expected_count}, sensitivity: {sensitivity}.'
+                ),
+                'green',
+            )
+        else:
+            reason = response.results[0].reason if response.results else 'unknown'
+            self.set_status(status_label, f'Detector parameter rejected: {reason}', 'red')
 
     def set_detection_sensitivity(self, status_label, sensitivity_value: int) -> None:
         sensitivity = self.clamp_sensitivity(sensitivity_value)
@@ -159,6 +278,55 @@ class MissionUIButton(Node):
             return 50
         return max(0, min(100, sensitivity))
 
+    def calculate_target_path(
+        self,
+        status_label,
+        barrel_count_text: str,
+        sensitivity_value: int,
+    ) -> None:
+        expected_count = self.parse_expected_barrel_count(barrel_count_text, status_label)
+        if expected_count is None:
+            return
+
+        sensitivity = self.clamp_sensitivity(sensitivity_value)
+        if self.detector_param_cli.wait_for_service(timeout_sec=0.05):
+            self.set_detector_parameters(status_label, expected_count, sensitivity)
+
+        if not self.mission_param_cli.wait_for_service(timeout_sec=0.1):
+            self.trigger_action(self.cli_calc, 'Calculating Target', status_label)
+            return
+
+        request = SetParameters.Request()
+        parameter = Parameter()
+        parameter.name = 'expected_barrel_count'
+        parameter.value = ParameterValue(
+            type=ParameterType.PARAMETER_INTEGER,
+            integer_value=int(expected_count),
+        )
+        request.parameters = [parameter]
+        future = self.mission_param_cli.call_async(request)
+        future.add_done_callback(
+            lambda done: self.calculate_after_mission_parameter(
+                done,
+                status_label,
+            )
+        )
+
+    def calculate_after_mission_parameter(self, future, status_label) -> None:
+        try:
+            response = future.result()
+            successful = bool(response.results and response.results[0].successful)
+        except Exception as exc:
+            self.set_status(status_label, f'Mission target update failed: {exc}', 'red')
+            return
+
+        if not successful:
+            reason = response.results[0].reason if response.results else 'unknown'
+            self.set_status(status_label, f'Mission target rejected: {reason}', 'red')
+            return
+
+        self.trigger_action(self.cli_calc, 'Calculating Target', status_label)
+
     def parse_expected_barrel_count(self, barrel_count_text: str, status_label):
         value = barrel_count_text.strip()
         if not value:
@@ -203,13 +371,29 @@ class MissionUIButton(Node):
 
         try:
             self.processes[name] = subprocess.Popen(
-                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
         except OSError as exc:
             self.set_status(status_label, f'Failed to start {name}: {exc}', 'red')
             return
 
         self.set_status(status_label, f'Started {name}.', 'green')
+        status_label.after(1000, lambda: self.report_process_exit(name, status_label))
+
+    def report_process_exit(self, name: str, status_label) -> None:
+        process = self.processes.get(name)
+        if process is None or process.poll() is None:
+            return
+
+        self.processes.pop(name, None)
+        self.set_status(
+            status_label,
+            f'{name} exited immediately with code {process.returncode}.',
+            'red',
+        )
 
     def trigger_action(self, client, action_name, status_label) -> None:
         if not client.wait_for_service(timeout_sec=0.5):
@@ -498,7 +682,11 @@ def main(args=None) -> None:
 
     # --- Mission Execution Frame ---
     btn_calc = tk.Button(root, text='3. Calculate Target Path', font=('Arial', 11, 'bold'), bg='orange', fg='black',
-                         command=lambda: node.trigger_action(node.cli_calc, "Calculating Target", status_lbl))
+                         command=lambda: node.calculate_target_path(
+                             status_lbl,
+                             expected_barrels_var.get(),
+                             sensitivity_var.get(),
+                         ))
     btn_calc.pack(fill='x', padx=10, pady=(12, 2), ipady=8)
 
     btn_nav = tk.Button(root, text='4. START NAVIGATION', font=('Arial', 12, 'bold'), bg='green', fg='white',
@@ -520,6 +708,15 @@ def main(args=None) -> None:
 
     tk.Button(root, text="⏹ STOP & RESET", font=("Arial", 11, "bold"), bg="red", fg="white",
               command=lambda: node.stop_all(status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
+
+    root.after(
+        500,
+        lambda: node.start_detectors(
+            status_lbl,
+            expected_barrels_var.get(),
+            sensitivity_var.get(),
+        ),
+    )
 
     def on_close() -> None:
         node.stop_child_processes()

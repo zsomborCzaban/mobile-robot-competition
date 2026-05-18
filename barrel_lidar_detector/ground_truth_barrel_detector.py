@@ -106,6 +106,7 @@ class GroundTruthBarrelDetector(Node):
 
     def on_parameters_updated(self, parameters) -> SetParametersResult:
         detector_parameter_names = {
+            'expected_barrel_count',
             'detection_sensitivity',
             'occupied_threshold',
             'free_threshold',

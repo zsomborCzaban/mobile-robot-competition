@@ -11,7 +11,7 @@ slam_toolbox:
     # starve live SLAM/RViz updates. 0.03 keeps more detail without the same
     # CPU and memory spike.
     resolution: 0.03
-    map_update_interval: 3.0
+    map_update_interval: 1.0
 
     transform_publish_period: 0.02
     transform_timeout: 0.2
