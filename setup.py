@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'ground_truth_barrel_detector = barrel_lidar_detector.ground_truth_barrel_detector:main',
+            'map_debug_monitor = barrel_lidar_detector.map_debug_monitor:main',
             'mission_controller = barrel_lidar_detector.mission_controller:main',
             'offline_barrel_marker = barrel_lidar_detector.offline_barrel_marker:main',
             'ui_remote = barrel_lidar_detector.ui_button:main',

@@ -93,6 +93,50 @@ map -> odom -> base_link/base_footprint -> rplidar_link
 Nav2 action servers
 ```
 
+## Map/Navigation Debugging
+
+If navigation gets stuck and you suspect `/map` is not being published or read,
+start the debug monitor in a sourced terminal:
+
+```bash
+ros2 run barrel_lidar_detector map_debug_monitor
+```
+
+It subscribes to `/map` with both common QoS styles and publishes:
+
+```text
+/map_debug_status
+/map_debug_markers
+```
+
+In RViz, add `MarkerArray` topic `/map_debug_markers`. The marker text reports
+whether the map is fresh or stale, map size/resolution, frame, cell counts,
+publisher/subscriber count, and the discovered `/map` publisher QoS.
+
+Useful terminal checks during a stuck run:
+
+```bash
+ros2 node list
+ros2 topic list | grep map
+ros2 topic info /map --verbose
+ros2 topic hz /map
+ros2 topic echo /map --once
+ros2 run tf2_ros tf2_echo map base_footprint
+ros2 run tf2_ros tf2_echo map base_link
+ros2 lifecycle nodes
+ros2 action list | grep navigate
+```
+
+Interpretation:
+
+- `NO MAP` in `/map_debug_status`: SLAM/localization is not publishing `/map`,
+  the ROS domain/network is wrong, or QoS is incompatible.
+- `STALE map age=...`: a map arrived, but updates stopped.
+- `/map` exists but `tf2_echo map base_footprint` fails: navigation cannot
+  plan reliably because localization/TF is broken.
+- `/map` is fresh and TF works, but Nav2 is stuck: inspect Nav2 lifecycle state,
+  costmaps, and action feedback next.
+
 ## Computer
 
 Run the UI, detector nodes, mission controller, and RViz on the computer. The
