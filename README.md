@@ -111,7 +111,20 @@ It subscribes to `/map` with both common QoS styles and publishes:
 
 In RViz, add `MarkerArray` topic `/map_debug_markers`. The marker text reports
 whether the map is fresh or stale, map size/resolution, frame, cell counts,
-publisher/subscriber count, and the discovered `/map` publisher QoS.
+publisher/subscriber count, discovered `/map` publisher QoS, `map` to
+`base_footprint` TF health, and `/cmd_vel` health.
+
+During navigation with `slam:=off localization:=true`, `/map` usually comes
+from `map_server` and may be published only once as a latched/static map. In
+that case `OK_STATIC map age=...` is healthy. During active SLAM, `/map` should
+update repeatedly; `STALE map age=...` is then a real warning.
+
+You can force the expected mode if needed:
+
+```bash
+ros2 run barrel_lidar_detector map_debug_monitor --ros-args -p map_mode:=live
+ros2 run barrel_lidar_detector map_debug_monitor --ros-args -p map_mode:=static
+```
 
 Useful terminal checks during a stuck run:
 
@@ -121,6 +134,8 @@ ros2 topic list | grep map
 ros2 topic info /map --verbose
 ros2 topic hz /map
 ros2 topic echo /map --once
+ros2 topic info /cmd_vel --verbose
+ros2 topic hz /cmd_vel
 ros2 run tf2_ros tf2_echo map base_footprint
 ros2 run tf2_ros tf2_echo map base_link
 ros2 lifecycle nodes
@@ -131,11 +146,16 @@ Interpretation:
 
 - `NO MAP` in `/map_debug_status`: SLAM/localization is not publishing `/map`,
   the ROS domain/network is wrong, or QoS is incompatible.
-- `STALE map age=...`: a map arrived, but updates stopped.
-- `/map` exists but `tf2_echo map base_footprint` fails: navigation cannot
-  plan reliably because localization/TF is broken.
-- `/map` is fresh and TF works, but Nav2 is stuck: inspect Nav2 lifecycle state,
-  costmaps, and action feedback next.
+- `OK_STATIC map age=...`: navigation is using a static map from `map_server`;
+  this is normal.
+- `STALE map age=...`: a map arrived, but updates stopped unexpectedly.
+- `TF_MISSING map->base_footprint`: localization/AMCL is not producing the
+  robot pose in the map. Set `2D Pose Estimate` in RViz and inspect AMCL/Nav2.
+- `CMD_VEL none` or `CMD_VEL_STALE`: Nav2 is not currently commanding motion.
+  Inspect lifecycle state, action feedback, planners/controllers, and costmaps.
+- `CMD_VEL_OK` but the robot does not move: the command is being generated, so
+  inspect Raspberry Pi robot bringup, base driver, safety/estop, and network
+  transport to the robot.
 
 ## Computer
 
@@ -166,20 +186,6 @@ Recommended full workflow:
    ```bash
    ros2 launch turtlebot4_navigation slam.launch.py
    ```
-
-   For a more detailed map, use the package SLAM config instead of editing the
-   system config directly:
-
-   ```bash
-   ros2 launch turtlebot4_navigation slam.launch.py \
-     params:=~/Desktop/studies/autonomous_mobile_robots/practical_work/code/install/barrel_lidar_detector/share/barrel_lidar_detector/config/slam_toolbox_mapping.yaml
-   ```
-
-   The config uses `0.03 m/cell`. Avoid `0.01 m/cell` for live mapping unless
-   you have confirmed the computer can keep up: compared with the normal
-   `0.05 m/cell`, it creates 25 times as many map cells and can make
-   `slam_toolbox`, RViz, and the barrel detector fall behind until `/map`
-   appears stuck.
 
 3. On the computer, start RViz:
 

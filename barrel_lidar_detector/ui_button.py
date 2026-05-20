@@ -7,6 +7,7 @@ import tkinter as tk
 from typing import Dict, List
 
 import rclpy
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
@@ -21,6 +22,7 @@ from rclpy.qos import (
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from tf2_msgs.msg import TFMessage
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -49,6 +51,9 @@ class MissionUIButton(Node):
         self.control_buttons: Dict[str, tk.Button] = {}
         self.last_map_time = 0.0
         self.last_scan_time = 0.0
+        self.last_amcl_pose_time = 0.0
+        self.last_tf_time = 0.0
+        self.last_map_odom_tf_time = 0.0
         self.route_ready = False
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -84,6 +89,18 @@ class MissionUIButton(Node):
             qos_profile_sensor_data,
         )
         self.create_subscription(
+            PoseWithCovarianceStamped,
+            '/amcl_pose',
+            self.amcl_pose_callback,
+            10,
+        )
+        self.create_subscription(
+            TFMessage,
+            '/tf',
+            self.tf_callback,
+            50,
+        )
+        self.create_subscription(
             String,
             'mission_status',
             self.mission_status_callback,
@@ -107,6 +124,18 @@ class MissionUIButton(Node):
     def scan_callback(self, _message: LaserScan) -> None:
         self.last_scan_time = time.monotonic()
 
+    def amcl_pose_callback(self, _message: PoseWithCovarianceStamped) -> None:
+        self.last_amcl_pose_time = time.monotonic()
+
+    def tf_callback(self, message: TFMessage) -> None:
+        now = time.monotonic()
+        self.last_tf_time = now
+        for transform in message.transforms:
+            parent_frame = transform.header.frame_id.lstrip('/')
+            child_frame = transform.child_frame_id.lstrip('/')
+            if parent_frame == 'map' and child_frame == 'odom':
+                self.last_map_odom_tf_time = now
+
     def mission_status_callback(self, message: String) -> None:
         if self.status_label is None:
             return
@@ -123,12 +152,24 @@ class MissionUIButton(Node):
         now = time.monotonic()
         map_age = now - self.last_map_time if self.last_map_time else None
         scan_age = now - self.last_scan_time if self.last_scan_time else None
+        amcl_pose_age = (
+            now - self.last_amcl_pose_time if self.last_amcl_pose_time else None
+        )
+        tf_age = now - self.last_tf_time if self.last_tf_time else None
+        map_odom_tf_age = (
+            now - self.last_map_odom_tf_time if self.last_map_odom_tf_time else None
+        )
         map_ready = self.last_map_time > 0.0
         scan_ready = scan_age is not None and scan_age <= 3.0
+        amcl_pose_ready = amcl_pose_age is not None and amcl_pose_age <= 5.0
+        tf_ready = tf_age is not None and tf_age <= 2.0
+        map_odom_tf_ready = map_odom_tf_age is not None and map_odom_tf_age <= 5.0
         localized, tf_detail = self.localization_status()
         mission_ready = self.cli_calc.service_is_ready()
         detector_ready = self.detector_param_cli.service_is_ready()
         nav_preconditions_ready = map_ready and scan_ready and localized and mission_ready
+        particle_publishers = self.count_publishers('/particle_cloud')
+        amcl_pose_publishers = self.count_publishers('/amcl_pose')
 
         self.set_readiness(
             'map',
@@ -139,6 +180,34 @@ class MissionUIButton(Node):
             'scan',
             scan_ready,
             f'/scan live{self.age_suffix(scan_age)}' if scan_ready else 'waiting for live /scan',
+        )
+        self.set_readiness(
+            'amcl_pose',
+            amcl_pose_ready,
+            (
+                f'/amcl_pose live{self.age_suffix(amcl_pose_age)}'
+                if amcl_pose_ready
+                else f'waiting for /amcl_pose; publishers={amcl_pose_publishers}'
+            ),
+        )
+        self.set_readiness(
+            'particles',
+            particle_publishers > 0,
+            f'/particle_cloud publishers={particle_publishers}',
+        )
+        self.set_readiness(
+            'tf',
+            tf_ready,
+            f'/tf live{self.age_suffix(tf_age)}' if tf_ready else 'waiting for /tf',
+        )
+        self.set_readiness(
+            'map_odom',
+            map_odom_tf_ready,
+            (
+                f'map->odom on /tf{self.age_suffix(map_odom_tf_age)}'
+                if map_odom_tf_ready
+                else 'waiting for AMCL map->odom TF'
+            ),
         )
         self.set_readiness('localization', localized, tf_detail)
         self.set_readiness(
@@ -742,6 +811,10 @@ def create_readiness_panel(root):
     rows = (
         ('map', 'Map'),
         ('scan', 'Laser scan'),
+        ('amcl_pose', 'AMCL pose'),
+        ('particles', 'AMCL particles'),
+        ('tf', 'TF stream'),
+        ('map_odom', 'AMCL TF'),
         ('localization', 'Localization'),
         ('mission', 'Mission controller'),
         ('detector', 'Barrel detector'),
@@ -781,7 +854,7 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    root.geometry('420x820')
+    root.geometry('440x900')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)

@@ -2,6 +2,7 @@ import time
 from typing import Optional
 
 import rclpy
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import (
@@ -11,6 +12,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from std_msgs.msg import String
+from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
 
@@ -19,12 +21,25 @@ class MapDebugMonitor(Node):
         super().__init__('map_debug_monitor')
 
         self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('target_frame', 'map')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('map_mode', 'auto')
         self.declare_parameter('stale_after_sec', 5.0)
+        self.declare_parameter('cmd_vel_stale_after_sec', 2.0)
         self.declare_parameter('status_period_sec', 1.0)
 
         self.map_topic = str(self.get_parameter('map_topic').value)
+        self.cmd_vel_topic = str(self.get_parameter('cmd_vel_topic').value)
+        self.target_frame = str(self.get_parameter('target_frame').value)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.map_mode = str(self.get_parameter('map_mode').value).lower()
         self.stale_after_sec = max(
             float(self.get_parameter('stale_after_sec').value),
+            0.1,
+        )
+        self.cmd_vel_stale_after_sec = max(
+            float(self.get_parameter('cmd_vel_stale_after_sec').value),
             0.1,
         )
         status_period_sec = max(
@@ -34,8 +49,13 @@ class MapDebugMonitor(Node):
 
         self.last_map: Optional[OccupancyGrid] = None
         self.last_map_monotonic: Optional[float] = None
+        self.last_cmd_vel: Optional[Twist] = None
+        self.last_cmd_vel_monotonic: Optional[float] = None
         self.last_qos_label = 'none'
         self.map_messages = 0
+        self.cmd_vel_messages = 0
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         reliable_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -68,6 +88,12 @@ class MapDebugMonitor(Node):
             lambda message: self.map_callback(message, 'best_effort/volatile'),
             best_effort_qos,
         )
+        self.create_subscription(
+            Twist,
+            self.cmd_vel_topic,
+            self.cmd_vel_callback,
+            10,
+        )
 
         self.status_pub = self.create_publisher(String, '/map_debug_status', 10)
         self.marker_pub = self.create_publisher(
@@ -79,6 +105,8 @@ class MapDebugMonitor(Node):
 
         self.get_logger().info(
             f'Map debug monitor watching {self.map_topic}. '
+            f'Checking TF {self.target_frame}->{self.base_frame} and '
+            f'{self.cmd_vel_topic}. '
             'RViz topics: /map_debug_status, /map_debug_markers'
         )
 
@@ -87,6 +115,11 @@ class MapDebugMonitor(Node):
         self.last_map_monotonic = time.monotonic()
         self.last_qos_label = qos_label
         self.map_messages += 1
+
+    def cmd_vel_callback(self, message: Twist) -> None:
+        self.last_cmd_vel = message
+        self.last_cmd_vel_monotonic = time.monotonic()
+        self.cmd_vel_messages += 1
 
     def publish_status(self) -> None:
         status = self.status_text()
@@ -101,18 +134,24 @@ class MapDebugMonitor(Node):
     def status_text(self) -> str:
         publisher_count = self.count_publishers(self.map_topic)
         subscriber_count = self.count_subscribers(self.map_topic)
-        endpoint_summary = self.endpoint_summary()
+        cmd_vel_publishers = self.count_publishers(self.cmd_vel_topic)
+        cmd_vel_subscribers = self.count_subscribers(self.cmd_vel_topic)
+        publishers = self.get_publishers_info_by_topic(self.map_topic)
+        endpoint_summary = self.endpoint_summary(publishers)
+        tf_summary = self.tf_summary()
+        cmd_vel_summary = self.cmd_vel_summary(cmd_vel_publishers, cmd_vel_subscribers)
 
         if self.last_map is None or self.last_map_monotonic is None:
             return (
                 f'NO MAP on {self.map_topic}. '
                 f'publishers={publisher_count}, subscribers={subscriber_count}. '
+                f'{tf_summary}; {cmd_vel_summary}. '
                 f'{endpoint_summary}'
             )
 
         age = time.monotonic() - self.last_map_monotonic
         grid = self.last_map
-        status = 'STALE' if age > self.stale_after_sec else 'OK'
+        status = self.map_status(age, publishers)
         origin = grid.info.origin.position
         occupied, free, unknown = self.cell_counts(grid)
 
@@ -124,11 +163,67 @@ class MapDebugMonitor(Node):
             f'cells free={free}, occupied={occupied}, unknown={unknown}; '
             f'messages={self.map_messages}; '
             f'publishers={publisher_count}, subscribers={subscriber_count}. '
-            f'{endpoint_summary}'
+            f'{tf_summary}; {cmd_vel_summary}. {endpoint_summary}'
         )
 
-    def endpoint_summary(self) -> str:
-        publishers = self.get_publishers_info_by_topic(self.map_topic)
+    def tf_summary(self) -> str:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame,
+                self.base_frame,
+                rclpy.time.Time(),
+            )
+        except TransformException as exc:
+            return f'TF_MISSING {self.target_frame}->{self.base_frame}: {exc}'
+
+        translation = transform.transform.translation
+        return (
+            f'TF_OK {self.target_frame}->{self.base_frame} '
+            f'pos=({translation.x:.2f},{translation.y:.2f})'
+        )
+
+    def cmd_vel_summary(self, publisher_count: int, subscriber_count: int) -> str:
+        if self.last_cmd_vel is None or self.last_cmd_vel_monotonic is None:
+            return (
+                f'CMD_VEL none on {self.cmd_vel_topic}; '
+                f'publishers={publisher_count}, subscribers={subscriber_count}'
+            )
+
+        age = time.monotonic() - self.last_cmd_vel_monotonic
+        status = 'CMD_VEL_OK' if age <= self.cmd_vel_stale_after_sec else 'CMD_VEL_STALE'
+        linear = self.last_cmd_vel.linear
+        angular = self.last_cmd_vel.angular
+        return (
+            f'{status} age={age:.1f}s '
+            f'linear=({linear.x:.2f},{linear.y:.2f}) angular_z={angular.z:.2f}; '
+            f'messages={self.cmd_vel_messages}; '
+            f'publishers={publisher_count}, subscribers={subscriber_count}'
+        )
+
+    def map_status(self, age: float, publishers) -> str:
+        if age <= self.stale_after_sec:
+            return 'OK'
+
+        if self.static_map_expected(publishers):
+            return 'OK_STATIC'
+
+        return 'STALE'
+
+    def static_map_expected(self, publishers) -> bool:
+        if self.map_mode == 'static':
+            return True
+
+        if self.map_mode == 'live':
+            return False
+
+        return any(
+            'map_server' in endpoint.node_name
+            or 'map_server' in endpoint.node_namespace
+            for endpoint in publishers
+        )
+
+    @staticmethod
+    def endpoint_summary(publishers) -> str:
         if not publishers:
             return 'No /map publishers discovered.'
 
