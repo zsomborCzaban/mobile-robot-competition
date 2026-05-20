@@ -6,6 +6,8 @@ slam_toolbox:
     odom_frame: odom
     base_frame: base_footprint
     scan_topic: /scan
+    minimum_laser_range: 0.2
+    maximum_laser_range: 8.0
 
     # 0.01 creates 25x more cells than TurtleBot's usual 0.05 map and can
     # starve live SLAM/RViz updates. 0.03 keeps more detail without the same
