@@ -29,13 +29,11 @@ from tf2_ros import Buffer, TransformException, TransformListener
 class MissionUIButton(Node):
     def __init__(self) -> None:
         super().__init__('mission_ui_button')
-        # All 5 Service Clients
         self.cli_calc = self.create_client(Trigger, 'calculate_target')
         self.cli_nav = self.create_client(Trigger, 'start_navigation')
         self.cli_pause = self.create_client(Trigger, 'pause_navigation')
         self.cli_res = self.create_client(Trigger, 'resume_navigation')
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
-        self.cli_fallback = self.create_client(Trigger, 'fallback_recovery')
         self.mission_param_cli = self.create_client(
             SetParameters,
             '/barrel_mission_controller/set_parameters',
@@ -48,7 +46,6 @@ class MissionUIButton(Node):
         self.processes: Dict[str, subprocess.Popen] = {}
         self.status_label = None
         self.readiness_labels: Dict[str, tk.Label] = {}
-        self.control_buttons: Dict[str, tk.Button] = {}
         self.last_map_time = 0.0
         self.last_scan_time = 0.0
         self.last_amcl_pose_time = 0.0
@@ -114,10 +111,6 @@ class MissionUIButton(Node):
     def set_readiness_labels(self, labels: Dict[str, tk.Label]) -> None:
         self.readiness_labels = labels
 
-    def set_control_buttons(self, buttons: Dict[str, tk.Button]) -> None:
-        self.control_buttons = buttons
-        self.update_readiness()
-
     def map_callback(self, _message: OccupancyGrid) -> None:
         self.last_map_time = time.monotonic()
 
@@ -167,7 +160,6 @@ class MissionUIButton(Node):
         localized, tf_detail = self.localization_status()
         mission_ready = self.cli_calc.service_is_ready()
         detector_ready = self.detector_param_cli.service_is_ready()
-        nav_preconditions_ready = map_ready and scan_ready and localized and mission_ready
         particle_publishers = self.count_publishers('/particle_cloud')
         amcl_pose_publishers = self.count_publishers('/amcl_pose')
 
@@ -226,13 +218,6 @@ class MissionUIButton(Node):
             'route calculated' if self.route_ready else 'calculate target path',
         )
 
-        self.set_button_state('detection', map_ready)
-        self.set_button_state('calc', mission_ready and detector_ready and map_ready)
-        self.set_button_state('nav', nav_preconditions_ready and self.route_ready)
-        self.set_button_state('pause', mission_ready)
-        self.set_button_state('resume', mission_ready)
-        self.set_button_state('fallback', mission_ready and localized)
-
     @staticmethod
     def age_suffix(age) -> str:
         if age is None:
@@ -263,13 +248,6 @@ class MissionUIButton(Node):
         color = '#1b7f35' if ready else '#9a6700'
         prefix = 'READY' if ready else 'WAIT'
         label.after(0, lambda: label.config(text=f'{prefix}: {detail}', fg=color))
-
-    def set_button_state(self, key: str, enabled: bool) -> None:
-        button = self.control_buttons.get(key)
-        if button is None:
-            return
-        state = tk.NORMAL if enabled else tk.DISABLED
-        button.after(0, lambda: button.config(state=state))
 
     @staticmethod
     def set_status(status_label, text: str, color: str) -> None:
@@ -568,21 +546,6 @@ class MissionUIButton(Node):
 
         return count
 
-    def stop_detectors(self, status_label) -> None:
-        stopped = self.stop_named_processes(
-            (
-                'ground_truth_barrel_detector',
-                'lidar_cluster_detector',
-                'map_shape_detector',
-            ),
-            include_stale=True,
-        )
-
-        if stopped:
-            self.set_status(status_label, 'Stopped: ' + ', '.join(stopped), 'orange')
-        else:
-            self.set_status(status_label, 'No detector process found.', 'gray')
-
     def start_process(self, name: str, command: List[str], status_label) -> None:
         process = self.processes.get(name)
         if process is not None and process.poll() is None:
@@ -632,6 +595,45 @@ class MissionUIButton(Node):
             self.set_status(status_label, response.message, color)
         except Exception as exc:
             self.set_status(status_label, f'Service call failed: {exc}', 'red')
+
+    def restart_ros_daemon(self, status_label) -> None:
+        self.set_status(status_label, 'Restarting ROS 2 daemon...', 'orange')
+        threading.Thread(
+            target=self._restart_ros_daemon_worker,
+            args=(status_label,),
+            daemon=True,
+        ).start()
+
+    def _restart_ros_daemon_worker(self, status_label) -> None:
+        try:
+            stop_result = subprocess.run(
+                ['ros2', 'daemon', 'stop'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10.0,
+                check=False,
+            )
+            start_result = subprocess.run(
+                ['ros2', 'daemon', 'start'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10.0,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.set_status(status_label, f'ROS 2 daemon restart failed: {exc}', 'red')
+            return
+
+        if start_result.returncode == 0:
+            self.set_status(status_label, 'ROS 2 daemon restarted.', 'green')
+            return
+
+        details = (start_result.stderr or start_result.stdout or '').strip()
+        if not details:
+            details = f'stop={stop_result.returncode}, start={start_result.returncode}'
+        self.set_status(status_label, f'ROS 2 daemon restart failed: {details}', 'red')
 
     def stop_all(self, status_label) -> None:
         self.set_status(status_label, 'Stopping mission and package nodes...', 'orange')
@@ -854,7 +856,7 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    root.geometry('440x900')
+    root.geometry('440x780')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
@@ -932,25 +934,11 @@ def main(args=None) -> None:
         length=285,
     ).pack(side='left', fill='x', expand=True)
 
-    # --- Setup & Detection Frame ---
     btn_controller = tk.Button(root, text='1. Start Mission Controller', font=('Arial', 11, 'bold'), bg='lightgray', fg='black',
                                command=lambda: node.start_mission_controller(status_lbl, expected_barrels_var.get()))
     btn_controller.pack(fill='x', padx=10, pady=2, ipady=8)
 
-    btn_detection = tk.Button(root, text='2. Start Map Barrel Detection', font=('Arial', 11, 'bold'), bg='deepskyblue', fg='black',
-                              command=lambda: node.start_detectors(
-                                  status_lbl,
-                                  expected_barrels_var.get(),
-                                  sensitivity_var.get(),
-                              ))
-    btn_detection.pack(fill='x', padx=10, pady=2, ipady=8)
-
-    btn_stop_detection = tk.Button(root, text='Stop Detection', font=('Arial', 10), bg='gray', fg='white',
-                                   command=lambda: node.stop_detectors(status_lbl))
-    btn_stop_detection.pack(fill='x', padx=10, pady=2, ipady=6)
-
-    # --- Mission Execution Frame ---
-    btn_calc = tk.Button(root, text='3. Calculate Target Path', font=('Arial', 11, 'bold'), bg='orange', fg='black',
+    btn_calc = tk.Button(root, text='2. Calculate Target Path', font=('Arial', 11, 'bold'), bg='orange', fg='black',
                          command=lambda: node.calculate_target_path(
                              status_lbl,
                              expected_barrels_var.get(),
@@ -958,11 +946,10 @@ def main(args=None) -> None:
                          ))
     btn_calc.pack(fill='x', padx=10, pady=(12, 2), ipady=8)
 
-    btn_nav = tk.Button(root, text='4. START NAVIGATION', font=('Arial', 12, 'bold'), bg='green', fg='white',
+    btn_nav = tk.Button(root, text='3. START NAVIGATION', font=('Arial', 12, 'bold'), bg='green', fg='white',
                         command=lambda: node.trigger_action(node.cli_nav, "Starting Navigation", status_lbl))
     btn_nav.pack(fill='x', padx=10, pady=2, ipady=8)
 
-    # --- State Machine Controls Frame ---
     control_frame = tk.Frame(root)
     control_frame.pack(fill='x', padx=10, pady=5)
     
@@ -974,23 +961,11 @@ def main(args=None) -> None:
                            command=lambda: node.trigger_action(node.cli_res, "Resuming", status_lbl))
     btn_resume.pack(side='right', expand=True)
 
-    btn_fallback = tk.Button(root, text="FALLBACK: TURN + BACK UP + REPLAN", font=("Arial", 10, "bold"), bg="purple", fg="white",
-                             command=lambda: node.trigger_action(node.cli_fallback, "Starting fallback", status_lbl))
-    btn_fallback.pack(fill='x', padx=10, pady=2, ipady=6)
+    tk.Button(root, text='Restart ROS 2 Daemon', font=('Arial', 10, 'bold'), bg='steelblue', fg='white',
+              command=lambda: node.restart_ros_daemon(status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
 
     tk.Button(root, text="⏹ STOP & RESET", font=("Arial", 11, "bold"), bg="red", fg="white",
               command=lambda: node.stop_all(status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
-
-    node.set_control_buttons(
-        {
-            'detection': btn_detection,
-            'calc': btn_calc,
-            'nav': btn_nav,
-            'pause': btn_pause,
-            'resume': btn_resume,
-            'fallback': btn_fallback,
-        }
-    )
 
     def on_close() -> None:
         node.stop_child_processes()

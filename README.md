@@ -9,7 +9,7 @@ classification:
   with the same Hough-circle classifier used by the offline marker, writes the
   barrel YAML, and publishes RViz markers.
 - `mission_controller`: reads the barrel YAML and sends all approach goals to Nav2.
-- `ui_remote`: button UI for starting detection and navigation.
+- `ui_remote`: button UI for mission control and navigation.
 
 Main target output:
 
@@ -284,7 +284,12 @@ Recommended full workflow:
 5. Set `Expected barrels` in the UI. Use `0` for unlimited, or enter the
    exact number of barrels you expect in the arena.
 6. Press `Start Mission Controller`.
-7. Press `Start Map Barrel Detection`.
+7. Start map barrel detection in another sourced terminal:
+
+   ```bash
+   ros2 run barrel_lidar_detector ground_truth_barrel_detector
+   ```
+
 8. Drive around during SLAM until the full arena is mapped and the barrels are
    detected. Confirm red markers appear and
    `~/turtlebot4_ws/barrel_target.yaml` contains the barrel entries. If
@@ -317,24 +322,24 @@ Older quick button order:
 
 1. Set `Expected barrels`.
 2. `Start Mission Controller`
-3. `Start Map Barrel Detection`
+3. Run `ground_truth_barrel_detector` in another terminal.
 4. Drive around during SLAM until the barrels are detected and written to YAML.
 5. Start Nav2 with the saved map.
 6. `Calculate Target Path`
 7. `START NAVIGATION`
 
-The UI also exposes pause, resume, fallback, and stop/reset controls for the
-active multi-barrel mission. `FALLBACK: TURN + BACK UP + REPLAN` cancels the
-current Nav2 goal, turns the robot around, backs up `1.0 m`, recalculates the
-remaining barrel route from the new robot pose, and starts navigation again.
+The UI also exposes pause, resume, and stop/reset controls for the active
+multi-barrel mission. The readiness panel is informational; the UI does not
+disable mission buttons based on readiness checks.
 
 The `Barrel detection sensitivity` slider controls the running
 `ground_truth_barrel_detector`. `50` is the default setting that matches the
 blue-marked example maps. Higher values accept weaker/partial circles; lower
 values make the detector more conservative.
 
-The UI starts detector/controller processes on the computer. That is expected:
-the Raspberry Pi runs the robot stack, while the computer runs this package.
+The UI starts the mission controller process on the computer. The detector can
+run in another terminal on the computer. The Raspberry Pi runs the robot stack,
+while the computer runs this package.
 
 Manual workflow instead:
 
