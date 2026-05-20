@@ -54,6 +54,37 @@ source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=<same_as_computer>
 ```
 
+Before starting ROS nodes, make sure the Raspberry Pi clock matches the
+computer clock. Timestamp mismatches break TF and message filtering.
+
+For automatic sync, configure the computer as a local NTP server and configure
+the Raspberry Pi to follow it:
+
+```bash
+./scripts/setup_local_time_server.sh ubuntu@<raspberry-pi-ip>
+```
+
+If the computer has multiple network interfaces and the script picks the wrong
+IP, pass the computer's robot-network IP explicitly:
+
+```bash
+./scripts/setup_local_time_server.sh ubuntu@<raspberry-pi-ip> 22 <computer-ip-on-robot-network>
+```
+
+This installs/configures `chrony` on both machines. The Raspberry Pi will keep
+syncing from the computer whenever both are on the same robot network, including
+when there is no internet access. Keep the computer awake while using the robot.
+
+For a one-time manual sync instead:
+
+```bash
+./scripts/sync_rpi_time.sh ubuntu@<raspberry-pi-ip>
+```
+
+The manual script disables NTP on the Raspberry Pi, sets its system time to the
+computer's current Unix time over SSH, and prints both clocks. Restart robot
+bringup after changing time so TF buffers do not keep old timestamps.
+
 ## Mapping vs Navigation Launches
 
 `view_robot.launch.py` is only RViz. It lets you see the robot, map, scan, TF,
