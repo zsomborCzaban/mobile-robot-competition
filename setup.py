@@ -27,7 +27,6 @@ setup(
             'map_debug_monitor = barrel_lidar_detector.map_debug_monitor:main',
             'mission_controller = barrel_lidar_detector.mission_controller:main',
             'offline_barrel_marker = barrel_lidar_detector.offline_barrel_marker:main',
-            'scan_tf_repair = barrel_lidar_detector.scan_tf_repair:main',
             'ui_remote = barrel_lidar_detector.ui_button:main',
         ],
     },
