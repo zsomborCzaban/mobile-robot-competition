@@ -181,50 +181,61 @@ ros2 run barrel_lidar_detector ui_remote
 Recommended full workflow:
 
 1. On the robot/Raspberry Pi, start the normal TurtleBot 4 robot bringup.
-2. On the computer, start SLAM:
+2. On the computer, start the scan-frame TF guard:
+
+   ```bash
+   ros2 run barrel_lidar_detector scan_tf_repair
+   ```
+
+   Keep it running while mapping. It watches `/scan`, verifies that the scan
+   frame is connected to `base_link`, and only publishes a repair static TF if
+   the robot bringup did not provide one. Its status is published on
+   `/scan_tf_repair_status`.
+
+3. On the computer, start SLAM:
 
    ```bash
    ros2 launch turtlebot4_navigation slam.launch.py
    ```
 
-3. On the computer, start RViz:
+4. On the computer, start RViz:
 
    ```bash
    ros2 launch turtlebot4_viz view_robot.launch.py
    ```
 
-4. Start the button UI:
+5. Start the button UI:
 
    ```bash
    ros2 run barrel_lidar_detector ui_remote
    ```
 
-5. Set `Expected barrels` in the UI. Use `0` for unlimited, or enter the
+6. Set `Expected barrels` in the UI. Use `0` for unlimited, or enter the
    exact number of barrels you expect in the arena.
-6. Press `Start Mission Controller`.
-7. Press `Start Map Barrel Detection`.
-8. Drive around during SLAM until the full arena is mapped and the barrels are
+7. Press `Start Mission Controller`.
+8. Press `Start Map Barrel Detection`.
+9. Drive around during SLAM until the full arena is mapped and the barrels are
    detected. Confirm red markers appear and
    `~/turtlebot4_ws/barrel_target.yaml` contains the barrel entries. If
    `Expected barrels` is greater than `0`, only the strongest detected
    candidates are kept.
-9. Save the map:
+10. Save the map:
 
    ```bash
    ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap "name:
      data: 'arena_map'"
    ```
 
-10. Stop SLAM, then start Nav2 with the saved map:
+11. Stop SLAM, then start Nav2 with the saved map:
 
     ```bash
     ros2 launch turtlebot4_navigation nav_bringup.launch.py \
       slam:=off localization:=true map:=/full/path/to/arena_map.yaml
     ```
 
-11. In RViz, use `2D Pose Estimate` if localization needs the initial pose.
-12. Press `Calculate Target Path`.
-13. Press `START NAVIGATION`.
+12. In RViz, use `2D Pose Estimate` if localization needs the initial pose.
+13. Press `Calculate Target Path`.
+14. Press `START NAVIGATION`.
 
 The expected barrel count is passed to both `ground_truth_barrel_detector` and
 `mission_controller`. The detector ranks barrels by classifier score and keeps
