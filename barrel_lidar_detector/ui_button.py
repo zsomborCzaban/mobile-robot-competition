@@ -7,11 +7,21 @@ import tkinter as tk
 from typing import Dict, List
 
 import rclpy
+from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 class MissionUIButton(Node):
@@ -35,21 +45,162 @@ class MissionUIButton(Node):
         
         self.processes: Dict[str, subprocess.Popen] = {}
         self.status_label = None
+        self.readiness_labels: Dict[str, tk.Label] = {}
+        self.control_buttons: Dict[str, tk.Button] = {}
+        self.last_map_time = 0.0
+        self.last_scan_time = 0.0
+        self.route_ready = False
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        static_map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        live_map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_callback,
+            static_map_qos,
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_callback,
+            live_map_qos,
+        )
+        self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_callback,
+            qos_profile_sensor_data,
+        )
         self.create_subscription(
             String,
             'mission_status',
             self.mission_status_callback,
             10,
         )
+        self.create_timer(1.0, self.update_readiness)
 
     def set_status_label(self, status_label) -> None:
         self.status_label = status_label
+
+    def set_readiness_labels(self, labels: Dict[str, tk.Label]) -> None:
+        self.readiness_labels = labels
+
+    def set_control_buttons(self, buttons: Dict[str, tk.Button]) -> None:
+        self.control_buttons = buttons
+        self.update_readiness()
+
+    def map_callback(self, _message: OccupancyGrid) -> None:
+        self.last_map_time = time.monotonic()
+
+    def scan_callback(self, _message: LaserScan) -> None:
+        self.last_scan_time = time.monotonic()
 
     def mission_status_callback(self, message: String) -> None:
         if self.status_label is None:
             return
 
+        text = message.data.lower()
+        if 'calculated shortest route' in text:
+            self.route_ready = True
+        elif 'mission stopped' in text or 'calculate the target' in text:
+            self.route_ready = False
+
         self.set_status(self.status_label, message.data, 'blue')
+
+    def update_readiness(self) -> None:
+        now = time.monotonic()
+        map_age = now - self.last_map_time if self.last_map_time else None
+        scan_age = now - self.last_scan_time if self.last_scan_time else None
+        map_ready = self.last_map_time > 0.0
+        scan_ready = scan_age is not None and scan_age <= 3.0
+        localized, tf_detail = self.localization_status()
+        mission_ready = self.cli_calc.service_is_ready()
+        detector_ready = self.detector_param_cli.service_is_ready()
+        nav_preconditions_ready = map_ready and scan_ready and localized and mission_ready
+
+        self.set_readiness(
+            'map',
+            map_ready,
+            f'/map received{self.age_suffix(map_age)}' if map_ready else 'waiting for /map',
+        )
+        self.set_readiness(
+            'scan',
+            scan_ready,
+            f'/scan live{self.age_suffix(scan_age)}' if scan_ready else 'waiting for live /scan',
+        )
+        self.set_readiness('localization', localized, tf_detail)
+        self.set_readiness(
+            'mission',
+            mission_ready,
+            'mission controller service online' if mission_ready else 'start mission controller',
+        )
+        self.set_readiness(
+            'detector',
+            detector_ready,
+            'map detector online' if detector_ready else 'start map barrel detection',
+        )
+        self.set_readiness(
+            'route',
+            self.route_ready,
+            'route calculated' if self.route_ready else 'calculate target path',
+        )
+
+        self.set_button_state('detection', map_ready)
+        self.set_button_state('calc', mission_ready and detector_ready and map_ready)
+        self.set_button_state('nav', nav_preconditions_ready and self.route_ready)
+        self.set_button_state('pause', mission_ready)
+        self.set_button_state('resume', mission_ready)
+        self.set_button_state('fallback', mission_ready and localized)
+
+    @staticmethod
+    def age_suffix(age) -> str:
+        if age is None:
+            return ''
+        return f' age={age:.1f}s'
+
+    def localization_status(self):
+        for base_frame in ('base_footprint', 'base_link'):
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    'map',
+                    base_frame,
+                    rclpy.time.Time(),
+                )
+            except TransformException:
+                continue
+            translation = transform.transform.translation
+            return (
+                True,
+                f'map->{base_frame} ({translation.x:.2f}, {translation.y:.2f})',
+            )
+        return False, 'set 2D Pose Estimate; waiting for map->base TF'
+
+    def set_readiness(self, key: str, ready: bool, detail: str) -> None:
+        label = self.readiness_labels.get(key)
+        if label is None:
+            return
+        color = '#1b7f35' if ready else '#9a6700'
+        prefix = 'READY' if ready else 'WAIT'
+        label.after(0, lambda: label.config(text=f'{prefix}: {detail}', fg=color))
+
+    def set_button_state(self, key: str, enabled: bool) -> None:
+        button = self.control_buttons.get(key)
+        if button is None:
+            return
+        state = tk.NORMAL if enabled else tk.DISABLED
+        button.after(0, lambda: button.config(state=state))
 
     @staticmethod
     def set_status(status_label, text: str, color: str) -> None:
@@ -577,6 +728,50 @@ def create_marker_legend(root) -> None:
     add_legend_row(legend, '#ffffff', 'White', 'barrel ID labels')
 
 
+def create_readiness_panel(root):
+    panel = tk.LabelFrame(
+        root,
+        text='Readiness',
+        font=('Arial', 10, 'bold'),
+        padx=8,
+        pady=5,
+    )
+    panel.pack(fill='x', padx=10, pady=(0, 8))
+
+    labels = {}
+    rows = (
+        ('map', 'Map'),
+        ('scan', 'Laser scan'),
+        ('localization', 'Localization'),
+        ('mission', 'Mission controller'),
+        ('detector', 'Barrel detector'),
+        ('route', 'Route'),
+    )
+    for key, title in rows:
+        row = tk.Frame(panel)
+        row.pack(fill='x', pady=1)
+        tk.Label(
+            row,
+            text=f'{title}:',
+            width=17,
+            anchor='w',
+            font=('Arial', 9, 'bold'),
+        ).pack(side='left')
+        label = tk.Label(
+            row,
+            text='WAIT: checking...',
+            anchor='w',
+            justify='left',
+            font=('Arial', 9),
+            wraplength=230,
+            fg='#9a6700',
+        )
+        label.pack(side='left', fill='x', expand=True)
+        labels[key] = label
+
+    return labels
+
+
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = MissionUIButton()
@@ -586,13 +781,14 @@ def main(args=None) -> None:
 
     root = tk.Tk()
     root.title('TurtleBot Barrel Mission Pro')
-    root.geometry('390x720')
+    root.geometry('420x820')
     root.attributes('-topmost', True)
 
     status_lbl = tk.Label(root, text='Waiting for input...', font=('Arial', 10), wraplength=330)
     status_lbl.pack(fill='x', padx=10, pady=(8, 4))
     node.set_status_label(status_lbl)
     create_marker_legend(root)
+    node.set_readiness_labels(create_readiness_panel(root))
 
     target_frame = tk.LabelFrame(
         root,
@@ -697,25 +893,30 @@ def main(args=None) -> None:
     control_frame = tk.Frame(root)
     control_frame.pack(fill='x', padx=10, pady=5)
     
-    tk.Button(control_frame, text="⏸ PAUSE", font=("Arial", 10, "bold"), bg="gold", fg="black", width=12,
-              command=lambda: node.trigger_action(node.cli_pause, "Pausing", status_lbl)).pack(side='left', expand=True)
+    btn_pause = tk.Button(control_frame, text="⏸ PAUSE", font=("Arial", 10, "bold"), bg="gold", fg="black", width=12,
+                          command=lambda: node.trigger_action(node.cli_pause, "Pausing", status_lbl))
+    btn_pause.pack(side='left', expand=True)
               
-    tk.Button(control_frame, text="▶ RESUME", font=("Arial", 10, "bold"), bg="lightgreen", fg="black", width=12,
-              command=lambda: node.trigger_action(node.cli_res, "Resuming", status_lbl)).pack(side='right', expand=True)
+    btn_resume = tk.Button(control_frame, text="▶ RESUME", font=("Arial", 10, "bold"), bg="lightgreen", fg="black", width=12,
+                           command=lambda: node.trigger_action(node.cli_res, "Resuming", status_lbl))
+    btn_resume.pack(side='right', expand=True)
 
-    tk.Button(root, text="FALLBACK: TURN + BACK UP + REPLAN", font=("Arial", 10, "bold"), bg="purple", fg="white",
-              command=lambda: node.trigger_action(node.cli_fallback, "Starting fallback", status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
+    btn_fallback = tk.Button(root, text="FALLBACK: TURN + BACK UP + REPLAN", font=("Arial", 10, "bold"), bg="purple", fg="white",
+                             command=lambda: node.trigger_action(node.cli_fallback, "Starting fallback", status_lbl))
+    btn_fallback.pack(fill='x', padx=10, pady=2, ipady=6)
 
     tk.Button(root, text="⏹ STOP & RESET", font=("Arial", 11, "bold"), bg="red", fg="white",
               command=lambda: node.stop_all(status_lbl)).pack(fill='x', padx=10, pady=2, ipady=6)
 
-    root.after(
-        500,
-        lambda: node.start_detectors(
-            status_lbl,
-            expected_barrels_var.get(),
-            sensitivity_var.get(),
-        ),
+    node.set_control_buttons(
+        {
+            'detection': btn_detection,
+            'calc': btn_calc,
+            'nav': btn_nav,
+            'pause': btn_pause,
+            'resume': btn_resume,
+            'fallback': btn_fallback,
+        }
     )
 
     def on_close() -> None:
