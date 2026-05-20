@@ -188,6 +188,57 @@ Interpretation:
   inspect Raspberry Pi robot bringup, base driver, safety/estop, and network
   transport to the robot.
 
+## Create 3 Speaker
+
+The Create 3 base can play note sequences through its built-in speaker. It does
+not play arbitrary audio files; melodies must be encoded as frequencies or note
+names with durations.
+
+Check that the speaker topic is visible:
+
+```bash
+ros2 topic list | grep cmd_audio
+```
+
+Play the default theme:
+
+```bash
+ros2 run barrel_lidar_detector create3_music
+```
+
+List available melodies:
+
+```bash
+ros2 run barrel_lidar_detector create3_music --ros-args -p list_melodies:=true
+```
+
+Melodies live in `config/create3_melodies.yaml`. Each entry is either a note
+name such as `C5`, `F#4`, or `REST`, or a raw frequency in hertz:
+
+```yaml
+melodies:
+  my_sound:
+    - {note: C5, duration: 0.2}
+    - {note: E5, duration: 0.2}
+    - {frequency: 784, duration: 0.4}
+```
+
+Then run:
+
+```bash
+ros2 run barrel_lidar_detector create3_music --ros-args -p melody:=my_sound
+```
+
+To preview the melody on the computer before playing it on the robot, render it
+to a WAV file:
+
+```bash
+python3 scripts/render_create3_melody.py epic_theme
+```
+
+This writes `/tmp/create3_epic_theme.wav`, which can be opened in any audio
+player.
+
 ## Computer
 
 Run the UI, detector nodes, mission controller, and RViz on the computer. The
