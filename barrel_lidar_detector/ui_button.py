@@ -34,6 +34,8 @@ class MissionUIButton(Node):
         self.cli_pause = self.create_client(Trigger, 'pause_navigation')
         self.cli_res = self.create_client(Trigger, 'resume_navigation')
         self.cli_stop = self.create_client(Trigger, 'stop_navigation')
+        self.cli_auto_start = self.create_client(Trigger, 'start_auto_exploration')
+        self.cli_auto_stop = self.create_client(Trigger, 'stop_auto_exploration')
         self.mission_param_cli = self.create_client(
             SetParameters,
             '/barrel_mission_controller/set_parameters',
@@ -52,6 +54,7 @@ class MissionUIButton(Node):
         self.last_tf_time = 0.0
         self.last_map_odom_tf_time = 0.0
         self.route_ready = False
+        self.auto_detection_active = False
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -596,6 +599,98 @@ class MissionUIButton(Node):
         except Exception as exc:
             self.set_status(status_label, f'Service call failed: {exc}', 'red')
 
+    def toggle_auto_detection(
+        self,
+        status_label,
+        barrel_count_text: str,
+        sensitivity_value: int,
+        button,
+    ) -> None:
+        if self.auto_detection_active:
+            self.stop_auto_detection(status_label, button)
+            return
+
+        self.start_detectors(status_label, barrel_count_text, sensitivity_value)
+        self.start_process(
+            'auto_explorer',
+            ['ros2', 'run', 'barrel_lidar_detector', 'auto_explorer'],
+            status_label,
+        )
+        self.set_status(
+            status_label,
+            'Starting automatic maze detection...',
+            'blue',
+        )
+        status_label.after(
+            1000,
+            lambda: self.call_auto_start(status_label, button, attempts_remaining=8),
+        )
+
+    def call_auto_start(self, status_label, button, attempts_remaining: int) -> None:
+        if not self.cli_auto_start.wait_for_service(timeout_sec=0.1):
+            if attempts_remaining <= 0:
+                self.set_status(status_label, 'Auto explorer service offline.', 'red')
+                return
+            status_label.after(
+                500,
+                lambda: self.call_auto_start(
+                    status_label,
+                    button,
+                    attempts_remaining - 1,
+                ),
+            )
+            return
+
+        request = Trigger.Request()
+        future = self.cli_auto_start.call_async(request)
+        future.add_done_callback(
+            lambda done: self.auto_start_response_callback(done, status_label, button)
+        )
+
+    def auto_start_response_callback(self, future, status_label, button) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.set_status(status_label, f'Auto detection start failed: {exc}', 'red')
+            return
+
+        if response.success:
+            self.auto_detection_active = True
+            self.set_status(status_label, response.message, 'green')
+            button.after(0, lambda: button.config(text='Stop Auto Detection'))
+        else:
+            self.set_status(status_label, response.message, 'red')
+
+    def stop_auto_detection(self, status_label, button) -> None:
+        if not self.cli_auto_stop.wait_for_service(timeout_sec=0.3):
+            stopped = self.stop_named_processes(('auto_explorer',), include_stale=True)
+            self.auto_detection_active = False
+            button.config(text='Start Auto Detection')
+            if stopped:
+                self.set_status(status_label, 'Auto explorer process stopped.', 'orange')
+            else:
+                self.set_status(status_label, 'Auto explorer service offline.', 'gray')
+            return
+
+        self.set_status(status_label, 'Stopping automatic maze detection...', 'blue')
+        request = Trigger.Request()
+        future = self.cli_auto_stop.call_async(request)
+        future.add_done_callback(
+            lambda done: self.auto_stop_response_callback(done, status_label, button)
+        )
+
+    def auto_stop_response_callback(self, future, status_label, button) -> None:
+        try:
+            response = future.result()
+            color = 'green' if response.success else 'red'
+            self.set_status(status_label, response.message, color)
+        except Exception as exc:
+            self.set_status(status_label, f'Auto detection stop failed: {exc}', 'red')
+            return
+
+        self.auto_detection_active = False
+        button.after(0, lambda: button.config(text='Start Auto Detection'))
+
     def restart_ros_daemon(self, status_label) -> None:
         self.set_status(status_label, 'Restarting ROS 2 daemon...', 'orange')
         threading.Thread(
@@ -647,6 +742,7 @@ class MissionUIButton(Node):
                 (
                     'mission_controller',
                     'ground_truth_barrel_detector',
+                    'auto_explorer',
                     'lidar_cluster_detector',
                     'map_shape_detector',
                 ),
@@ -755,6 +851,7 @@ class MissionUIButton(Node):
             (
                 'mission_controller',
                 'ground_truth_barrel_detector',
+                'auto_explorer',
                 'lidar_cluster_detector',
                 'map_shape_detector',
             ),
@@ -937,6 +1034,15 @@ def main(args=None) -> None:
     btn_controller = tk.Button(root, text='1. Start Mission Controller', font=('Arial', 11, 'bold'), bg='lightgray', fg='black',
                                command=lambda: node.start_mission_controller(status_lbl, expected_barrels_var.get()))
     btn_controller.pack(fill='x', padx=10, pady=2, ipady=8)
+
+    btn_auto = tk.Button(root, text='Start Auto Detection', font=('Arial', 11, 'bold'), bg='mediumseagreen', fg='black',
+                         command=lambda: node.toggle_auto_detection(
+                             status_lbl,
+                             expected_barrels_var.get(),
+                             sensitivity_var.get(),
+                             btn_auto,
+                         ))
+    btn_auto.pack(fill='x', padx=10, pady=(8, 2), ipady=8)
 
     btn_calc = tk.Button(root, text='2. Calculate Target Path', font=('Arial', 11, 'bold'), bg='orange', fg='black',
                          command=lambda: node.calculate_target_path(

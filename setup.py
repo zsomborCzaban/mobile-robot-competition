@@ -23,6 +23,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'auto_explorer = barrel_lidar_detector.auto_explorer:main',
             'ground_truth_barrel_detector = barrel_lidar_detector.ground_truth_barrel_detector:main',
             'map_debug_monitor = barrel_lidar_detector.map_debug_monitor:main',
             'mission_controller = barrel_lidar_detector.mission_controller:main',

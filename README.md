@@ -284,14 +284,16 @@ Recommended full workflow:
 5. Set `Expected barrels` in the UI. Use `0` for unlimited, or enter the
    exact number of barrels you expect in the arena.
 6. Press `Start Mission Controller`.
-7. Start map barrel detection in another sourced terminal:
+7. Either press `Start Auto Detection` to start map detection and maze
+   exploration together, or start map barrel detection manually in another
+   sourced terminal:
 
    ```bash
    ros2 run barrel_lidar_detector ground_truth_barrel_detector
    ```
 
-8. Drive around during SLAM until the full arena is mapped and the barrels are
-   detected. Confirm red markers appear and
+8. Let auto detection explore the maze, or drive manually during SLAM, until
+   the full arena is mapped and the barrels are detected. Confirm red markers appear and
    `~/turtlebot4_ws/barrel_target.yaml` contains the barrel entries. If
    `Expected barrels` is greater than `0`, only the strongest detected
    candidates are kept.
@@ -322,7 +324,7 @@ Older quick button order:
 
 1. Set `Expected barrels`.
 2. `Start Mission Controller`
-3. Run `ground_truth_barrel_detector` in another terminal.
+3. `Start Auto Detection`, or run `ground_truth_barrel_detector` manually.
 4. Drive around during SLAM until the barrels are detected and written to YAML.
 5. Start Nav2 with the saved map.
 6. `Calculate Target Path`
@@ -331,6 +333,12 @@ Older quick button order:
 The UI also exposes pause, resume, and stop/reset controls for the active
 multi-barrel mission. The readiness panel is informational; the UI does not
 disable mission buttons based on readiness checks.
+
+`Start Auto Detection` starts the map detector and an `auto_explorer` node. The
+auto explorer uses LiDAR maze wall-following, publishes `/cmd_vel`, and can be
+stopped by pressing the same button again after it changes to
+`Stop Auto Detection`. Do not run keyboard teleop at the same time unless a
+velocity multiplexer is configured.
 
 The `Barrel detection sensitivity` slider controls the running
 `ground_truth_barrel_detector`. `50` is the default setting that matches the
@@ -344,6 +352,7 @@ while the computer runs this package.
 Manual workflow instead:
 
 ```bash
+ros2 run barrel_lidar_detector auto_explorer
 ros2 run barrel_lidar_detector ground_truth_barrel_detector
 ros2 run barrel_lidar_detector mission_controller
 ```
@@ -351,6 +360,8 @@ ros2 run barrel_lidar_detector mission_controller
 Then call:
 
 ```bash
+ros2 service call /start_auto_exploration std_srvs/srv/Trigger
+ros2 service call /stop_auto_exploration std_srvs/srv/Trigger
 ros2 service call /calculate_target std_srvs/srv/Trigger
 ros2 service call /start_navigation std_srvs/srv/Trigger
 ros2 service call /pause_navigation std_srvs/srv/Trigger
@@ -369,6 +380,32 @@ If the UI is missing Tkinter:
 
 ```bash
 sudo apt install python3-tk
+```
+
+## Auto Exploration
+
+`auto_explorer` is only for the SLAM/detection phase. It is intentionally
+separate from `mission_controller`, so automatic exploration does not replace
+the final Nav2 barrel route.
+
+The current behavior is tuned for maze-like arenas:
+
+- follow the right wall by default using left/front/right LiDAR sectors,
+- turn into right-side openings when a corridor appears,
+- turn away from blocked front sectors,
+- keep a target side distance instead of driving straight across a room,
+- publish zero velocity when stopped, closed, or waiting for fresh scans.
+
+Useful parameters:
+
+```bash
+ros2 run barrel_lidar_detector auto_explorer --ros-args \
+  -p wall_follow_side:=right \
+  -p forward_speed:=0.10 \
+  -p front_stop_distance:=0.42 \
+  -p side_target_distance:=0.45 \
+  -p side_open_distance:=0.80 \
+  -p turn_degrees:=86.0
 ```
 
 ## RViz
