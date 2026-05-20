@@ -11,6 +11,7 @@ fi
 TARGET="$1"
 PORT="${2:-22}"
 LAPTOP_IP="${3:-}"
+TARGET_HOST="${TARGET#*@}"
 
 if [[ -z "$LAPTOP_IP" ]]; then
   LAPTOP_IP="$(hostname -I | awk '{print $1}')"
@@ -19,6 +20,12 @@ fi
 if [[ -z "$LAPTOP_IP" ]]; then
   echo "Could not determine laptop IP address." >&2
   echo "Pass it explicitly as the third argument." >&2
+  exit 1
+fi
+
+if [[ "$TARGET_HOST" == "localhost" || "$TARGET_HOST" == "127.0.0.1" || "$TARGET_HOST" == "$LAPTOP_IP" ]]; then
+  echo "Refusing to configure the laptop as the Raspberry Pi target: $TARGET_HOST" >&2
+  echo "Pass the Raspberry Pi SSH target as the first argument." >&2
   exit 1
 fi
 
@@ -33,6 +40,10 @@ fi
 if [[ ! -f /etc/chrony/chrony.conf.codex-backup ]]; then
   sudo install -m 0644 /etc/chrony/chrony.conf /etc/chrony/chrony.conf.codex-backup
 fi
+
+# This file belongs only on the Raspberry Pi. If it exists on the laptop, chrony
+# can incorrectly discipline the laptop clock from the robot-side setup.
+sudo rm -f /etc/chrony/conf.d/laptop-time-source.conf
 
 sudo tee /etc/chrony/conf.d/robot-laptop-time-server.conf >/dev/null <<'CONF'
 # Serve the laptop clock to the robot on local/private networks.

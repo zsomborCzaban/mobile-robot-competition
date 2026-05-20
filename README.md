@@ -75,6 +75,20 @@ This installs/configures `chrony` on both machines. The Raspberry Pi will keep
 syncing from the computer whenever both are on the same robot network, including
 when there is no internet access. Keep the computer awake while using the robot.
 
+If the computer clock is wrong after experimenting with NTP, fix the computer
+first, then run the setup again:
+
+```bash
+sudo rm -f /etc/chrony/conf.d/laptop-time-source.conf
+sudo timedatectl set-ntp true
+sudo systemctl restart chrony
+timedatectl
+chronyc sources -v
+```
+
+The `laptop-time-source.conf` file belongs only on the Raspberry Pi. If it
+exists on the computer, remove it so the computer does not follow the robot.
+
 For a one-time manual sync instead:
 
 ```bash
